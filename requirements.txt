@@ -1,0 +1,11 @@
+# Dust Emission Model — dependencies
+numpy
+pandas
+xarray
+netCDF4
+rioxarray
+geopandas
+shapely
+requests
+cdsapi
+matplotlib

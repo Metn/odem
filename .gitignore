@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Data (not tracked)
+*.nc
+*.nc4
+*.tif
+*.hdf
+*.h5
+
+# Output directories
+output_*/
+plots/
+verify_*/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
