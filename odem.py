@@ -1140,16 +1140,21 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
                            inputs.lon, inputs.lat, inputs.times)
             del monthly_bufs[cm]
 
+    # Period-mean flux. Always computed — the run summary below reports the
+    # global budget from it, so gating the assignment on n_months made every
+    # single-month run (including both README quick-start examples) die with
+    # UnboundLocalError after the output had already been written.
+    F_mean = F_d_sum / inputs.nt  # kg/m²/s
+
     # Annual mean output — only written for multi-month runs.
     # Single-month runs would overwrite a valid annual mean with one month's data.
     n_months = len(set((t.year, t.month) for t in inputs.times))
     if n_months > 1:
-        F_mean = F_d_sum / inputs.nt  # kg/m²/s
         out_file = os.path.join(output_dir, 'odem_annual_mean.nc')
         _write_annual_mean(out_file, inputs.lon, inputs.lat, F_mean, F_d_max,
                            inputs.times[0], inputs.times[-1], inputs.nt)
     else:
-        log.info("  Skipping annual mean (single-month run)")
+        log.info("  Skipping annual mean file (single-month run)")
 
     # Diagnostic output
     if save_diags:
