@@ -53,6 +53,44 @@ are put on the meteorology grid by nearest neighbour by default. Add
 normalised over valid source cells only, so a cell with any valid source gets
 the area mean of its valid part. The default output is unchanged.
 
+### Emission schemes (v2)
+
+`--scheme` selects the emission physics; every scheme runs on the same
+surface state (land and snow mask, air density, soil moisture, bare-soil
+fraction) so that differences between schemes are differences in physics, not
+in forcing. `k14` (default) is the Kok et al. (2014) / Leung et al. (2023)
+scheme of v1.0; `aem` is the albedo-based drag partition of Chappell and Webb
+(2016) with MB95 saltation and needs `--modis-brdf`.
+
+#### DEAD scheme
+
+`dead_g` and `dead_z` implement the DEAD scheme of Zender et al. (2003a) as it
+is configured in GEOS-Chem (HEMCO `hcox_dustdead_mod.F`, the version used by
+GEOS-Chem 14.4.1 and described in Zhang et al., 2025, Appendix A2): u* from
+the 10 m wind by the neutral log profile with z0 = 1e-4 m and no drag
+partition, the Iversen and White (1982) dry threshold at 75 um, the Fecan et
+al. (1999) moisture factor with the GEOS-Chem threshold w_t = 0.17 + 0.14
+f_clay, the White (1979) saltation flux with C = 2.61, the Marticorena and
+Bergametti (1995) sandblasting efficiency alpha = 100 x 10^(13.4 f_clay - 6)
+m-1 (clay capped at 20 percent), and F_d = Q_s f_bare T S alpha. The two
+configurations differ only in the erodibility map S: `dead_g` uses the GOCART /
+Ginoux et al. (2001) topographic source function (`GOC_SRC`), `dead_z` the
+Zender et al. (2003b) geomorphic erodibility (`EF_GEO`), both read from the
+GEOS-Chem `DUST_DEAD` input directory given with `--dead-inputs` and regridded
+onto the meteorology grid with the run's `--regrid` method. T is the GEOS-Chem
+global mass tuning factor (`--dead-tuning`, default 4.7376e-4, the MERRA-2
+native-grid value of the offline DEAD emissions); the 10 m wind (`u10`, `v10`
+or MERRA-2 `U10M`, `V10M`) must be in the meteorology file. The docstring of
+`flux_dead` lists the GEOS-Chem details that are not reproduced (uniform 20
+percent clay, bare fraction from `LF_DRY`, fractional snow, bin partition).
+
+```bash
+python odem.py     --merra2 merra2_data/merra2_dust_200601.nc     --soilgrids soilgrids/     --prigent prigent_data/Prigent_2005_roughness_0.25x0.25.nc     --modis-lai modis_lai/2006     --landcover modis_landcover/modis_landcover_erodibility_2006.nc     --scheme dead_g --dead-inputs dust_inputs/dead_geoschem_v2014-07     --dead-tuning 4.7376e-4 --save-diags --output-dir output_dead_g
+```
+
+Other v2 flags: `--max-steps N` (development only, stops after N timesteps),
+`--modis-brdf` (the `aem` scheme), `--regrid conservative`.
+
 ### Resolution experiment: ERA5 on the MERRA-2 grid
 
 `regrid_met_conservative.py` regrids every variable of an ERA5 monthly file onto

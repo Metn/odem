@@ -17,6 +17,8 @@ Physics included:
   - Comola et al. (2019) turbulent intermittency
   - Spatially varying median soil diameter from clay+silt fractions
   - Fragmentation exponent capped at 3
+  - v2 schemes: albedo-based drag partition (aem) and the DEAD scheme of
+    Zender et al. (2003a) as configured in GEOS-Chem (dead_g, dead_z)
 
 Input datasets:
   - ERA5 surface fields (meteorology)
@@ -387,13 +389,17 @@ class InputData:
 
     def __init__(self, meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
                  landcover_file=None, meteo_source='era5', brdf_file=None,
-                 regrid_method='nearest'):
+                 regrid_method='nearest', dead_dir=None):
         """meteo_path: ERA5 or MERRA-2 file/directory. meteo_source: 'era5' or 'merra2'.
         brdf_file: NetCDF of monthly MODIS BRDF omega_n (scripts/brdf_tif_to_nc.py),
         needed by the albedo-based scheme only.
         regrid_method: 'nearest' (default, nearest neighbour) or 'conservative'
-        (area-weighted) for the static inputs regridded onto the meteorology grid."""
+        (area-weighted) for the static inputs regridded onto the meteorology grid.
+        dead_dir: directory with the GEOS-Chem DEAD inputs (HEMCO DUST_DEAD,
+        GOCART_src_fn.geos.2x25.nc and dst_tibds.geos.2x25.nc), needed by the
+        dead_g / dead_z schemes only."""
         self.meteo_source = meteo_source
+        self.dead_dir = Path(dead_dir) if dead_dir else None
         if regrid_method not in REGRID_METHODS:
             raise ValueError(f"Unknown regrid_method: {regrid_method!r} "
                              f"(use one of {REGRID_METHODS})")
@@ -406,6 +412,7 @@ class InputData:
         self.landcover_file = landcover_file
         self.brdf_file = Path(brdf_file) if brdf_file else None
         self._brdf_cache = {}  # {month: {'omega_n': array on the meteo grid}}
+        self.S = None          # DEAD erodibility map on the meteo grid (load_dead_S)
 
         # Multi-file meteo support (ERA5 or MERRA-2)
         self._era5_files = []      # list of (filepath, n_times) tuples
@@ -916,6 +923,39 @@ class InputData:
                  f"valid={int(valid.sum())} cells")
         return result
 
+    def load_dead_S(self, scheme):
+        """Load the DEAD erodibility map S for scheme 'dead_g' (GOC_SRC from
+        GOCART_src_fn.geos.2x25.nc) or 'dead_z' (EF_GEO from
+        dst_tibds.geos.2x25.nc), regrid it onto the meteorology grid with the
+        run's regrid method (nearest or conservative), fill 0 outside the
+        data, and keep it in self.S. Time invariant, so it goes to static['S']."""
+        if scheme not in DEAD_S_SOURCE:
+            raise ValueError(f"no DEAD erodibility source for scheme {scheme!r}")
+        if self.dead_dir is None:
+            raise ValueError(f"--scheme {scheme} needs --dead-inputs <dir> "
+                             "(GEOS-Chem DUST_DEAD directory with "
+                             "GOCART_src_fn.geos.2x25.nc and dst_tibds.geos.2x25.nc)")
+        fname, varname = DEAD_S_SOURCE[scheme]
+        fpath = self.dead_dir / fname
+        if not fpath.exists():
+            raise FileNotFoundError(f"DEAD input {fpath} not found")
+        log.info(f"DEAD erodibility S: {fpath} [{varname}]")
+        with nc4.Dataset(str(fpath), 'r') as ds:
+            s_lon = np.array(ds.variables['lon'][:], dtype=np.float64)
+            s_lat = np.array(ds.variables['lat'][:], dtype=np.float64)
+            S_src = np.array(ds.variables[varname][:], dtype=np.float64)
+        if S_src.ndim == 3:
+            S_src = S_src[0]
+        S_src = np.nan_to_num(S_src, nan=0.0)
+        S_src = np.clip(S_src, 0.0, None)
+        self.S = self._regrid(s_lon, s_lat, S_src, fill=0.0)
+        self.S = np.clip(np.nan_to_num(self.S, nan=0.0), 0.0, None)
+        n_pos = int(np.sum(self.S > 0))
+        log.info(f"  S ({varname}): source {S_src.shape} max={S_src.max():.4f}; "
+                 f"on meteo grid {n_pos} cells > 0, max={self.S.max():.4f}, "
+                 f"mean(>0)={self.S[self.S > 0].mean() if n_pos else 0:.4f}")
+        return self.S
+
     def close(self):
         if self._era5_ds:
             self._era5_ds.close()
@@ -1060,6 +1100,7 @@ def surface_state(met, static, lai):
         'clay_pct': clay_pct, 'z0a_valid': z0a_valid,
         'f_eff_r': f_eff_r, 'f_eff_v': f_eff_v, 'F_eff': F_eff,
         'wnd_frc_slt': wnd_frc_slt, 'f_bare': f_bare, 'ustar_st': ustar_st,
+        'gwc': gwc,
     }
 
 
@@ -1307,11 +1348,251 @@ def flux_aem(met, static, state, brdf):
     return F_d, diag
 
 
+# ---------------------------------------------------------------------------
+# DEAD scheme (Zender et al., 2003a) as configured in GEOS-Chem / HEMCO.
+# Added in v2 (2026-09-24). Reference implementation: HEMCO 3.9.1
+# hcox_dustdead_mod.F (the version GEOS-Chem 14.4.1 used); published
+# description: Zhang et al. (2025, GMD 18, 6767) Appendix A2, Eqs. A2 to A9.
+# ---------------------------------------------------------------------------
+DEAD_CONST = {
+    'g':           9.80665,   # m s-2, GRV_SFC in the Fortran (Zhang A2 writes 9.81)
+    'k_vk':        0.4,       # von Karman, CST_VON_KRM
+    'z_ref':       10.0,      # m, HGT_RFR: reference height of the wind
+    'z0_mbl':      100.0e-6,  # m, RGH_MMN_MBL: roughness of erodible surfaces (BLM_MBL)
+    'wnd_min':     1.0,       # m s-1, WND_MIN_MBL: floor on the 10 m wind (BLM_MBL)
+    'D_slt_opt':   75.0e-6,   # m, DMT_SLT_OPT: optimal saltation diameter (IvW82)
+    'rho_slt':     2650.0,    # kg m-3, DNS_SLT: density of saltating particles
+    'C_slt':       2.61,      # CST_SLT: White (1979) saltation constant
+    'gwc_thr_a':   0.17,      # kg kg-1, Fecan threshold intercept (FRC_THR_NCR_WTR_GET)
+    'gwc_thr_b':   0.14,      # kg kg-1 per clay fraction, Fecan threshold slope
+    'clay_cap':    0.20,      # max clay fraction in the MB95 sandblasting law
+    'alpha_unit':  100.0,     # m-1 per cm-1: MB95 Eq. 47 is in cm-1, the Fortran uses m-1
+    'rho_water':   1000.0,    # kg m-3, DNS_H2O_LQD_STD (VWC2GWC)
+    # Global mass tuning factor T (FLX_MSS_FDG_FCT, "Mass tuning factor" in
+    # HEMCO_Config.rc). GEOS-Chem 14.4.1 run/GCClassic/createRunDir.sh sets
+    # RUNDIR_DUSTDEAD_TF = 4.7586e-4 (merra2, 2x2.5), 7.8533e-4 (merra2, 4x5),
+    # 5.0416e-4 (geosfp, 2x2.5), 8.3286e-4 (geosfp, 4x5) and -999 (undefined)
+    # for the native 0.5x0.625 and 0.25x0.3125 grids, where GEOS-Chem reads
+    # the offline DEAD emissions of Meng et al. (2021) instead. Those files
+    # (HEMCO/OFFLINE_DUST/v2021-08, README of 23 April 2021) carry the
+    # MERRA-2 native-grid factor 4.7376e-4, which is the value used here.
+    'T_default':   4.7376e-4,
+}
+
+# Erodibility map S per DEAD configuration: (file in --dead-inputs, variable).
+DEAD_S_SOURCE = {
+    'dead_g': ('GOCART_src_fn.geos.2x25.nc', 'GOC_SRC'),   # Ginoux et al. (2001)
+    'dead_z': ('dst_tibds.geos.2x25.nc', 'EF_GEO'),        # Zender et al. (2003b) geomorphic
+}
+
+
+def dead_ustar_10m(u10, v10):
+    """Friction velocity from the 10 m wind by the neutral log profile
+    (BLM_MBL): u* = k max(U10, 1 m/s) / ln(z_ref / z0_mbl), z0_mbl = 1e-4 m.
+    Returns (u*, U10 after the floor)."""
+    D = DEAD_CONST
+    U = np.sqrt(np.asarray(u10, dtype=np.float64) ** 2
+                + np.asarray(v10, dtype=np.float64) ** 2)
+    U = np.maximum(U, D['wnd_min'])
+    return U * D['k_vk'] / np.log(D['z_ref'] / D['z0_mbl']), U
+
+
+def dead_ustar_ft0(rhoa):
+    """Iversen and White (1982) dry fluid threshold at D_p = 75 um
+    (WND_FRC_THR_SLT_GET), as a function of air density only.
+
+    Re  = 0.38 + 1331 (100 D_p)^1.56            (D_p in m, 100 D_p in cm)
+    B   = 1 + 6e-7 / (rho_p g D_p^2.5)
+    Re < 10:  G = -1 + 1.928 Re^0.0922,  u*ft0 = 0.129 sqrt(B / G) sqrt(rho_p g D_p / rho_a)
+    Re >= 10: G = 1 - 0.0858 exp(-0.0617 (Re - 10)),
+              u*ft0 = 0.12 sqrt(B) G sqrt(rho_p g D_p / rho_a)
+    At 75 um Re = 1.02, so the first branch applies.
+    """
+    D = DEAD_CONST
+    Dp = D['D_slt_opt']
+    Re = 0.38 + 1331.0 * (100.0 * Dp) ** 1.56
+    B = 1.0 + 6.0e-7 / (D['rho_slt'] * D['g'] * Dp ** 2.5)
+    if Re < 10.0:
+        G = -1.0 + 1.928 * Re ** 0.0922
+        tmp1 = 0.129 * 0.129 * B / G
+    else:
+        G = 1.0 - 0.0858 * np.exp(-0.0617 * (Re - 10.0))
+        tmp1 = 0.12 * 0.12 * B * G * G
+    dns_fct = D['rho_slt'] * D['g'] * Dp
+    return np.sqrt(tmp1) * np.sqrt(dns_fct / np.asarray(rhoa, dtype=np.float64))
+
+
+def dead_fecan(gwc, f_clay):
+    """Fecan et al. (1999) moisture factor as coded in FRC_THR_NCR_WTR_GET:
+    w_t = 0.17 + 0.14 f_clay (kg kg-1; the leading f_clay of Fecan Eq. 14 was
+    removed in the Fortran on 1999-11-05 'to improve large scale behavior'),
+    f_m = sqrt(1 + 1.21 (100 (w - w_t))^0.68) for w > w_t, else 1.
+    Returns (f_m, w_t)."""
+    D = DEAD_CONST
+    gwc = np.asarray(gwc, dtype=np.float64)
+    gwc_thr = D['gwc_thr_a'] + D['gwc_thr_b'] * np.asarray(f_clay, dtype=np.float64)
+    gwc_thr = np.broadcast_to(gwc_thr, gwc.shape)
+    f_m = np.ones_like(gwc)
+    wet = gwc > gwc_thr
+    f_m[wet] = np.sqrt(1.0 + 1.21 * (100.0 * (gwc[wet] - gwc_thr[wet])) ** 0.68)
+    return f_m, gwc_thr
+
+
+def dead_saltation(rhoa, ustar_s, ustar_ft):
+    """White (1979) streamwise saltation flux (FLX_MSS_HRZ_SLT_TTL_WHI79_GET):
+    Q_s = C_slt (rho_a / g) u*s^3 (1 - r)(1 + r)^2, r = u*ft / u*s, for u*s > u*ft,
+    else 0. Units kg m-1 s-1."""
+    D = DEAD_CONST
+    rhoa = np.asarray(rhoa, dtype=np.float64)
+    ustar_s = np.asarray(ustar_s, dtype=np.float64)
+    ustar_ft = np.asarray(ustar_ft, dtype=np.float64)
+    Q = np.zeros_like(ustar_s)
+    on = ustar_s > ustar_ft
+    r = ustar_ft[on] / ustar_s[on]
+    Q[on] = (D['C_slt'] * rhoa[on] * ustar_s[on] ** 3
+             * (1.0 - r) * (1.0 + r) * (1.0 + r) / D['g'])
+    return Q
+
+
+def dead_alpha(clay_pct):
+    """Marticorena and Bergametti (1995) sandblasting efficiency as coded in
+    FLX_MSS_VRT_DST_TTL_MAB95_GET: alpha = 100 x 10^(13.4 min(f_clay, 0.20) - 6)
+    in m-1 (MB95 Eq. 47 gives cm-1; the factor 100 converts). clay_pct in percent."""
+    D = DEAD_CONST
+    f_clay = np.minimum(np.asarray(clay_pct, dtype=np.float64) / 100.0, D['clay_cap'])
+    return D['alpha_unit'] * 10.0 ** (13.4 * f_clay - 6.0)
+
+
+def flux_dead(met, static, state, S=None, T=DEAD_CONST['T_default'], clay_pct=None):
+    """
+    DEAD dust emission scheme (Zender et al., 2003a) as configured in
+    GEOS-Chem / HEMCO (hcox_dustdead_mod.F, HEMCO 3.9.1), from a surface state.
+    Registered twice: 'dead_g' with the GOCART / Ginoux et al. (2001)
+    topographic source function and 'dead_z' with the Zender et al. (2003b)
+    geomorphic erodibility; the two differ only in the map S.
+
+    Equation chain (Zhang et al., 2025, Appendix A2, Eqs. A2 to A9; constants
+    from the Fortran where the two differ):
+      1. u*   = k max(U10, 1 m/s) / ln(10 m / 1e-4 m)            (A3, BLM_MBL)
+         u*s  = u*: no drag partition, no Owen effect (both removed from the
+         GEOS-Chem code on 2007-01-25).
+      2. u*ft0 = Iversen and White (1982) at D_p = 75 um          (A5 to A7)
+         Re = 0.38 + 1331 (100 D_p)^1.56 = 1.02; u*ft0 = 0.129 sqrt(B/G)
+         sqrt(rho_p g D_p / rho_a), B = 1 + 6e-7/(rho_p g D_p^2.5),
+         G = 1.928 Re^0.0922 - 1; 0.2046 m/s at rho_a = 1.225 kg m-3.
+      3. w    = rho_water swvl1 / rho_bulk (gravimetric water content, kg kg-1)
+         f_m  = sqrt(1 + 1.21 (100 (w - w_t))^0.68) for w > w_t, else 1  (A8)
+         w_t  = 0.17 + 0.14 f_clay                    (FRC_THR_NCR_WTR_GET)
+         u*ft = u*ft0 f_m                                              (A4)
+      4. Q_s  = C_z (rho_a/g) u*s^3 (1 - u*ft/u*s)(1 + u*ft/u*s)^2, C_z = 2.61,
+         for u*s > u*ft, else 0                                        (A2)
+      5. alpha = 100 x 10^(13.4 min(f_clay, 0.20) - 6)  [m-1]  (MAB95 routine)
+      6. F_d  = Q_s f_bare T S alpha                       (DST_MBL assembly)
+    T is the global mass tuning factor FLX_MSS_FDG_FCT ("Mass tuning factor"
+    in HEMCO_Config.rc); see DEAD_CONST['T_default'] for its provenance.
+
+    Where the published appendix and the Fortran disagree, the Fortran wins
+    for constants:
+      * g = 9.80665 (Fortran GRV_SFC) rather than 9.81 (A2).
+      * Fecan threshold: A9 gives w_t = 0.01 a (17 f_clay + 14 f_clay^2) with
+        a = 1/f_clay = 5 by default; the Fortran computes w_t = 0.17 + 0.14
+        f_clay, which is A9 with the leading f_clay divided out (a = 1/f_clay
+        exactly), so the two agree only when a is read that way.
+      * The 10 m wind is floored at 1 m/s (BLM_MBL WND_MIN_MBL), not in A3.
+      * alpha carries the factor 100 (cm-1 to m-1) that Leung et al. (2023,
+        Eq. 10) and A2 omit in writing phi = 10^(13.4 f_clay - 6).
+      * The threshold uses the mid-layer air density in GEOS-Chem; here the
+        shared state['rhoa'] (MERRA-2 RHOA or ERA5 surface density) is used.
+
+    Inputs from the shared layer so that every ODEM scheme sees the same
+    forcing and statics: rho_a = state['rhoa']; U10 from met['u10'],
+    met['v10'] (error if absent); w = state['gwc'] (rho_water swvl1 / bulk_den
+    with SoilGrids bulk density, the same expression as surface_state; the
+    Fortran VWC2GWC uses rho_bulk = 2650 (1 - VWC_sat) with VWC_sat = 0.489 -
+    0.00126 sand_pct); f_clay = static['clay'] / 100 (SoilGrids); snow and
+    land through state['mask']; f_bare = state['f_bare'] = f_erodible x
+    max(0, 1 - LAI/LAI_thr) x mask, the shared definition. GEOS-Chem instead
+    sets the bare fraction LND_FRC_MBL = 1 x LF_DRY x (1 - snow fraction),
+    with snow fraction = min(10 SWE / 0.05 m, 1), zero for frozen soil, lakes,
+    land ice and wetlands, and does not use VAI when the GOCART source
+    function is on. Threshold: the wet fluid threshold only (DEAD has no impact
+    threshold); no intermittency factor.
+
+    GEOS-Chem details NOT reproduced, and why:
+      * Uniform clay: SOI_TXT_GET overrides the clay map with MSS_FRC_CLY_GLB
+        = 0.20 everywhere ("fxm Temporarily"), so GEOS-Chem's alpha is 0.0479
+        m-1 and w_t = 0.198 kg kg-1 in every cell. ODEM uses the SoilGrids clay
+        so the schemes share statics; pass clay_pct=20.0 to reproduce the
+        GEOS-Chem behaviour (used for the diagnosis runs, never by default).
+      * Bare fraction from LF_DRY, fractional snow, soil-temperature freeze
+        cutoff (LND_FRC_MBL_GET): replaced by the shared f_bare and mask.
+      * Bulk density from VWC_sat(sand) (VWC2GWC, HYD_PRP_GET): replaced by
+        SoilGrids bulk density, the shared gwc.
+      * Mid-layer virtual-temperature air density (DST_MBL): shared rhoa.
+      * Size partition into 4 transport bins (FLX_MSS_VRT_DST_PRT): the sum
+        of the bins is 0.9188 of the total vertical flux (lognormal overlap of
+        the three d'Almeida modes with 0.2 to 12 um); ODEM returns the total.
+      * CaCO3 masking (off in GEOS-Chem), the 350 K temperature cap.
+
+    Parameters
+    ----------
+    S : ndarray (lat, lon) or None; erodibility on the meteo grid. None takes
+        static['S'] (set by run_model from --dead-inputs).
+    T : float, global mass tuning factor.
+    clay_pct : None (use static['clay']) or a float to hold clay uniform.
+
+    Returns
+    -------
+    F_d : ndarray (lat, lon), kg m-2 s-1 (total vertical dust flux)
+    diag : dict with ustar_10m, U_10m, ustar_ft0_iw, ustar_ft_dead,
+           f_moisture_dead, gwc, Q_s, alpha, S, f_bare, rhoa, mask
+    """
+    if S is None:
+        if 'S' not in static:
+            raise ValueError("flux_dead needs the erodibility map S: pass S= or "
+                             "run with --dead-inputs <dir> (static['S'])")
+        S = static['S']
+    if 'u10' not in met or 'v10' not in met:
+        raise ValueError("flux_dead needs the 10 m wind (met['u10'], met['v10']); "
+                         "the meteorology file has no U10M/V10M (u10/v10)")
+    mask = state['mask']
+    rhoa = np.asarray(state['rhoa'], dtype=np.float64)
+    f_bare = state['f_bare']
+    gwc = state['gwc']
+    clay = static['clay'] if clay_pct is None else np.full_like(rhoa, float(clay_pct))
+    f_clay = np.asarray(clay, dtype=np.float64) / 100.0
+
+    ustar_10m, U_10m = dead_ustar_10m(met['u10'], met['v10'])
+    ustar_ft0_iw = dead_ustar_ft0(rhoa)
+    f_moisture_dead, _ = dead_fecan(gwc, f_clay)
+    ustar_ft = ustar_ft0_iw * f_moisture_dead
+    Q_s = dead_saltation(rhoa, ustar_10m, ustar_ft)
+    alpha = dead_alpha(clay)
+
+    S = np.asarray(S, dtype=np.float64)
+    active = (mask > 0.5) & (f_bare > 0) & (S > 0) & (Q_s > 0)
+    F_d = np.zeros_like(rhoa)
+    F_d[active] = Q_s[active] * f_bare[active] * T * S[active] * alpha[active]
+    F_d = np.nan_to_num(F_d, nan=0.0, posinf=0.0, neginf=0.0)
+    F_d = np.clip(F_d, 0.0, None)
+
+    diag = {
+        'rhoa': rhoa, 'mask': mask, 'ustar_10m': ustar_10m, 'U_10m': U_10m,
+        'ustar_ft0_iw': ustar_ft0_iw, 'ustar_ft_dead': ustar_ft,
+        'f_moisture_dead': f_moisture_dead, 'gwc': gwc,
+        'Q_s': Q_s, 'alpha': alpha, 'S': S, 'f_bare': f_bare,
+    }
+    return F_d, diag
+
+
 # Scheme registry (v2). Each flux function takes (met, static, state, **kwargs)
 # where state comes from surface_state(), and returns (F_d, diag).
-SCHEMES = {'k14': flux_kok14, 'aem': flux_aem}
+SCHEMES = {'k14': flux_kok14, 'aem': flux_aem,
+           'dead_g': flux_dead, 'dead_z': flux_dead}
 SCHEME_LABEL = {'k14': 'Kok et al. (2014) + Leung et al. (2023)',
-                'aem': 'Chappell and Webb (2016) albedo drag partition + MB95 saltation'}
+                'aem': 'Chappell and Webb (2016) albedo drag partition + MB95 saltation',
+                'dead_g': 'DEAD (Zender et al. 2003a) as in GEOS-Chem, GOCART/Ginoux 2001 source function',
+                'dead_z': 'DEAD (Zender et al. 2003a) as in GEOS-Chem, Zender 2003b geomorphic erodibility'}
 # Per-timestep inputs a scheme needs beyond met/static/state.
 SCHEME_STEP_INPUTS = {'aem': lambda inputs, t: {'brdf': inputs.get_brdf(t)}}
 # Label of the scheme of the current run, written to output file attributes.
@@ -1481,6 +1762,15 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
         'C_d':          ('Erodibility coefficient C_d',    '1'),
         'eta':          ('Intermittency factor eta',       '1'),
         'f_moisture':   ('Fécan soil moisture correction', '1'),
+        'gwc':          ('Gravimetric soil water content',  'kg kg-1'),
+        'U_10m':        ('10 m wind speed',                 'm s-1'),
+        'ustar_10m':    ('Friction velocity from the 10 m wind (DEAD)', 'm s-1'),
+        'ustar_ft0_iw': ('Iversen-White dry threshold at 75 um (DEAD)', 'm s-1'),
+        'ustar_ft_dead':('Wet fluid threshold (DEAD)',      'm s-1'),
+        'f_moisture_dead': ('Fecan factor, DEAD threshold w_t', '1'),
+        'Q_s':          ('White 1979 saltation flux (DEAD)', 'kg m-1 s-1'),
+        'alpha':        ('MB95 sandblasting efficiency (DEAD)', 'm-1'),
+        'mask':         ('Land and no-snow mask',           '1'),
     }
     STATIC_META = {
         'D_p':       ('Median soil particle diameter',     'm'),
@@ -1490,6 +1780,7 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
         'bulk_den':  ('Soil bulk density',                 'kg m-3'),
         'f_erodible':('MODIS erodibility fraction',        '1'),
         'lsm':       ('Land-sea mask',                     '1'),
+        'S':         ('DEAD erodibility map S',            '1'),
     }
 
     with nc4.Dataset(filepath, 'w', format='NETCDF4') as ds:
@@ -1530,7 +1821,8 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
 def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
               landcover_file=None, output_dir='output_v2', C_tune=0.05,
               save_diags=False, meteo_source='era5', scheme='k14',
-              max_steps=None, brdf_file=None, regrid_method='nearest'):
+              max_steps=None, brdf_file=None, regrid_method='nearest',
+              dead_dir=None, dead_tuning=DEAD_CONST['T_default']):
     """Run ODEM — Offline Dust Emission Model.
 
     meteo_path:      ERA5 or MERRA-2 file/directory.
@@ -1541,12 +1833,18 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
                      regression runs only; the outputs then cover a partial month).
     brdf_file:       monthly MODIS BRDF NetCDF, required by scheme 'aem'.
     regrid_method:   'nearest' (default) or 'conservative' for the static inputs
-                     (Prigent z0a, SoilGrids, MODIS land cover, MODIS LAI, BRDF).
+                     (Prigent z0a, SoilGrids, MODIS land cover, MODIS LAI, BRDF, S).
+    dead_dir:        GEOS-Chem DUST_DEAD input directory, required by dead_g / dead_z.
+    dead_tuning:     DEAD global mass tuning factor T (FLX_MSS_FDG_FCT).
     """
     if scheme not in SCHEMES:
         raise ValueError(f"unknown scheme '{scheme}'; choose from {sorted(SCHEMES)}")
     if scheme == 'aem' and not brdf_file:
         raise ValueError("--scheme aem needs --modis-brdf <modis_brdf_YYYY.nc>")
+    if scheme in DEAD_S_SOURCE and not dead_dir:
+        raise ValueError(f"--scheme {scheme} needs --dead-inputs <dir> (GEOS-Chem "
+                         "DUST_DEAD directory with GOCART_src_fn.geos.2x25.nc and "
+                         "dst_tibds.geos.2x25.nc)")
     RUN_SCHEME['key'] = scheme
     RUN_SCHEME['label'] = SCHEME_LABEL[scheme]
     t0 = time.time()
@@ -1563,14 +1861,20 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     log.info(f"  Scheme:     {scheme} ({SCHEME_LABEL.get(scheme, scheme)})")
     if brdf_file:
         log.info(f"  MODIS BRDF: {brdf_file}")
+    if scheme in DEAD_S_SOURCE:
+        log.info(f"  DEAD inputs: {dead_dir} ({DEAD_S_SOURCE[scheme][1]})")
+        log.info(f"  DEAD T:     {dead_tuning:.4e} (global mass tuning factor)")
     log.info(f"  Regrid:     {regrid_method} (static inputs onto the meteo grid)")
     log.info("=" * 60)
 
     # Load inputs
     inputs = InputData(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
                        landcover_file=landcover_file, meteo_source=meteo_source,
-                       brdf_file=brdf_file, regrid_method=regrid_method)
+                       brdf_file=brdf_file, regrid_method=regrid_method,
+                       dead_dir=dead_dir)
     inputs.load()
+    if scheme in DEAD_S_SOURCE:
+        inputs.load_dead_S(scheme)
 
     # Precompute static fields
     # Use first MODIS LAI for D_p classification (arid vs non-arid)
@@ -1588,6 +1892,8 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
         'z0s': z0s,
         'f_erodible': inputs.f_erodible,
     }
+    if scheme in DEAD_S_SOURCE:
+        static['S'] = inputs.S
 
     log.info(f"  D_p: median={np.nanmedian(D_p)*1e6:.0f} µm, "
              f"range=[{np.nanmin(D_p)*1e6:.0f}, {np.nanmax(D_p)*1e6:.0f}] µm")
@@ -1600,7 +1906,12 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     # Diagnostic accumulators (only allocated if save_diags=True); the key set
     # is whatever the scheme returns, taken from the first timestep.
     diag_sums = {}
-    scheme_kwargs = {'C_tune': C_tune} if scheme == 'k14' else {}
+    if scheme == 'k14':
+        scheme_kwargs = {'C_tune': C_tune}
+    elif scheme in DEAD_S_SOURCE:
+        scheme_kwargs = {'T': float(dead_tuning)}
+    else:
+        scheme_kwargs = {}
     flux_fn = SCHEMES[scheme]
     step_inputs = SCHEME_STEP_INPUTS.get(scheme, lambda inputs_, t_: {})
     n_steps = inputs.nt if max_steps is None else min(inputs.nt, int(max_steps))
@@ -1645,7 +1956,8 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
             if n_active > 0:
                 log.info(f"    F_d: mean={F_d[active].mean():.2e}, "
                          f"max={F_d.max():.2e} kg/m²/s")
-                for k in ('f_eff_r', 'f_eff_v', 'eta', 'ustar_ratio', 'U_10m'):
+                for k in ('f_eff_r', 'f_eff_v', 'eta', 'ustar_ratio', 'U_10m',
+                          'ustar_10m', 'ustar_ft_dead', 'f_moisture_dead', 'alpha'):
                     if k in diag:
                         log.info(f"    {k}: mean={diag[k][active].mean():.3f}")
 
@@ -1768,6 +2080,12 @@ Examples:
     p.add_argument('--modis-brdf', default=None,
                    help='Monthly MODIS BRDF omega_n NetCDF (scripts/brdf_tif_to_nc.py); '
                         'required for --scheme aem')
+    p.add_argument('--dead-inputs', default=None,
+                   help='GEOS-Chem DUST_DEAD input directory (GOCART_src_fn.geos.2x25.nc, '
+                        'dst_tibds.geos.2x25.nc); required for --scheme dead_g / dead_z')
+    p.add_argument('--dead-tuning', type=float, default=DEAD_CONST['T_default'],
+                   help='DEAD global mass tuning factor T (FLX_MSS_FDG_FCT); default '
+                        f"{DEAD_CONST['T_default']:.4e} (GEOS-Chem MERRA-2 native grid)")
     args = p.parse_args()
 
     if args.era5:
@@ -1791,6 +2109,8 @@ Examples:
         max_steps=args.max_steps,
         brdf_file=args.modis_brdf,
         regrid_method=args.regrid,
+        dead_dir=args.dead_inputs,
+        dead_tuning=args.dead_tuning,
     )
 
 
