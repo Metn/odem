@@ -882,6 +882,38 @@ def test_v11_options(R):
                              f"z0a == conservative {np.array_equal(y_z0a, y_cons, equal_nan=True)}, "
                              f"soil == nearest {np.array_equal(y_soil, y_near, equal_nan=True)}")
 
+    # 5. Log-space aggregation for z0a ('conservative_log'): the area-weighted
+    #    mean of ln(z0a), exponentiated (geometric mean). Analytical case:
+    #    2:1 in latitude, same longitude, so each target cell is two source
+    #    cells with sin(lat) weights; a constant stays constant; a non-positive
+    #    source value is excluded from the mean.
+    s_lat = np.arange(-89.875, 90.0, 0.25); t_lat = np.arange(-89.75, 90.0, 0.5)
+    lon = np.arange(-180.0, 180.0, 1.0)
+    z = 10.0 ** rng.uniform(-5, -2, size=(s_lat.size, lon.size))
+    z[200, 10] = 0.0                                  # excluded: target row 100 keeps row 201 only
+    inp = InputData.__new__(InputData)
+    inp.regrid_method = 'nearest'; inp.regrid_fields = {'z0a': 'conservative_log'}; inp._regridders = {}
+    inp.lon, inp.lat = lon, t_lat; inp.nlon, inp.nlat = lon.size, t_lat.size
+    y = inp._regrid(lon, s_lat, z, fill=np.nan, field='z0a')
+    e = np.arange(-90.0, 90.0 + 1e-9, 0.25)
+    w = np.sin(np.deg2rad(e[1:])) - np.sin(np.deg2rad(e[:-1]))
+    lz = np.log(np.where(z > 0, z, np.nan))
+    num = np.nansum(np.stack([lz[0::2] * w[0::2, None], lz[1::2] * w[1::2, None]]), axis=0)
+    den = np.nansum(np.stack([np.where(np.isfinite(lz[0::2]), w[0::2, None], 0),
+                              np.where(np.isfinite(lz[1::2]), w[1::2, None], 0)]), axis=0)
+    expected = np.exp(num / den)
+    rel = float(np.nanmax(np.abs(y - expected) / expected))
+    yc = inp._regrid(lon, s_lat, np.full(z.shape, 3.0e-4), fill=np.nan, field='z0a')
+    cdev = float(np.nanmax(np.abs(yc - 3.0e-4)) / 3.0e-4)
+    excl = abs(y[100, 10] - z[201, 10]) / z[201, 10]
+    arith = inp._regrid_conservative(lon, s_lat, np.where(z > 0, z, np.nan), fill=np.nan)  # same valid set
+    below = bool(np.all(y[np.isfinite(y)] <= arith[np.isfinite(y)] * (1 + 1e-12)))
+    ok = rel <= 1e-12 and cdev <= 1e-12 and excl <= 1e-12 and below
+    (R.ok if ok else R.fail)("Regrid z0a in log space (geometric area mean)",
+                             f"max rel diff vs independent sin-weighted geometric mean {rel:.1e}; "
+                             f"constant dev {cdev:.1e}; zero source excluded {excl:.1e}; "
+                             f"<= arithmetic mean everywhere {below}")
+
 
 def test_diagnostic_ranges(diag_file, R):
     """Check all diagnostic fields against physically defensible bounds."""

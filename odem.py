@@ -171,6 +171,11 @@ REGRID_METHODS = ('nearest', 'conservative')
 # Static-input groups whose regrid method can be set on its own with
 # --regrid-field GROUP=METHOD (attribution runs); unset groups follow --regrid.
 REGRID_FIELDS = ('z0a', 'soil', 'f_erodible', 'lai', 'brdf', 'S')
+# Methods allowed per group: the global ones plus 'conservative_log', the
+# area-weighted mean of ln(x) exponentiated (geometric mean), the standard
+# aggregate for an aerodynamic roughness length because the drag partition
+# depends on ln(z0a / z0s). Meant for z0a; positive fields only.
+REGRID_FIELD_METHODS = REGRID_METHODS + ('conservative_log',)
 
 # netCDF-C chunk cache per variable, bytes (see InputData.__init__).
 NC_CHUNK_CACHE_BYTES = 200 * 1024 * 1024
@@ -424,9 +429,9 @@ class InputData:
         # Per-group overrides of regrid_method, e.g. {'z0a': 'conservative'}.
         self.regrid_fields = dict(regrid_fields or {})
         for g, m in self.regrid_fields.items():
-            if g not in REGRID_FIELDS or m not in REGRID_METHODS:
+            if g not in REGRID_FIELDS or m not in REGRID_FIELD_METHODS:
                 raise ValueError(f"bad regrid override {g}={m} (groups {REGRID_FIELDS}, "
-                                 f"methods {REGRID_METHODS})")
+                                 f"methods {REGRID_FIELD_METHODS})")
         self.dead_s_map = dead_s_map
         self._regridders = {}  # {(src_lat bytes, src_lon bytes): ConservativeRegridder}
         # netCDF chunk cache (v2, 2026-09-24). The monthly meteo files are
@@ -784,6 +789,16 @@ class InputData:
         Both treat NaN and values < -900 as missing.
         """
         method = self.regrid_fields.get(field, self.regrid_method)
+        if method == 'conservative_log':
+            # Geometric area mean: regrid ln(x), exponentiate. Non-positive
+            # and missing source values are excluded from the mean.
+            x = np.asarray(data, dtype=np.float64)
+            lnx = np.full(x.shape, np.nan)
+            pos = np.isfinite(x) & (x > 0)
+            lnx[pos] = np.log(x[pos])
+            out = self._regrid_conservative(src_lon, src_lat, lnx, fill=np.nan)
+            out = np.exp(out)
+            return np.where(np.isfinite(out), out, fill)
         if method == 'conservative':
             return self._regrid_conservative(src_lon, src_lat, data, fill=fill)
         return self._regrid_nearest(src_lon, src_lat, data, fill=fill)
@@ -2234,7 +2249,7 @@ Examples:
                         'default SoilGrids clay')
     p.add_argument('--regrid-field', action='append', default=[], metavar='GROUP=METHOD',
                    help='Override --regrid for one static group (repeatable); groups '
-                        f'{",".join(REGRID_FIELDS)}, methods {",".join(REGRID_METHODS)}')
+                        f'{",".join(REGRID_FIELDS)}, methods {",".join(REGRID_FIELD_METHODS)}')
     args = p.parse_args()
 
     if args.era5:
