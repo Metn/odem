@@ -13,12 +13,14 @@ mean is cached as meng_2006MM_mean.npz under --cache.
 import sys, io
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-import argparse, calendar, glob
+import argparse, calendar, glob, os
 from pathlib import Path
 import numpy as np
 import netCDF4 as nc
 
-R = "ODEM_DATA_ROOT"
+R = os.environ.get('ODEM_DATA_ROOT')
+if not R:
+    raise SystemExit('set ODEM_DATA_ROOT to the ODEM data directory (soilgrids/, prigent_data/, modis_lai/, ...)')
 MENG_DIR = f"{R}/dust_inputs/offline_dust_geoschem/v2021-08_DEAD"
 BIN_FRAC = 0.9187803392840019   # 4 GEOS-Chem transport bins / total DEAD vertical flux
 YEAR = 2006

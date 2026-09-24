@@ -3,7 +3,7 @@
 Usage: python scripts/dev/check_split_bitwise.py [odem_v1.py] [nsteps]
 Without odem_v1.py the v1.0.1 module is extracted from git (commit e2b54e8).
 """
-import sys, subprocess, tempfile, importlib.util, pathlib, numpy as np
+import os, sys, subprocess, tempfile, importlib.util, pathlib, numpy as np
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 import odem as new
@@ -22,7 +22,9 @@ else:
 spec = importlib.util.spec_from_file_location('odem_v1', v1_path)
 old = importlib.util.module_from_spec(spec); spec.loader.exec_module(old)
 
-R = 'ODEM_DATA_ROOT'
+R = os.environ.get('ODEM_DATA_ROOT')
+if not R:
+    raise SystemExit('set ODEM_DATA_ROOT to the ODEM data directory (soilgrids/, prigent_data/, modis_lai/, ...)')
 cases = [('merra2', f'{R}/merra2_monthly/merra2_dust_200601.nc'), ('era5', f'{R}/era5/era5_dust_200601.nc')]
 nsteps = int(argn[0]) if argn else 6
 for src, path in cases:

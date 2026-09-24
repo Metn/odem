@@ -5,7 +5,7 @@
 # ~1 GB and mostly numpy). Resumable: finished months are skipped.
 # Usage: bash scripts/run_ladder.sh   (from D:/coding_folder/Python/odem)
 set -eo pipefail
-R=ODEM_DATA_ROOT
+R=${ODEM_DATA_ROOT:?set ODEM_DATA_ROOT to the ODEM data directory}
 # MERRA-2 monthly inputs; override with M2_DIR=<internal copy> to keep reads off the external HDD
 M2=${M2_DIR:-$R/merra2_monthly_v2}
 COMMON="--scheme k14 --regrid conservative --soilgrids $R/soilgrids --prigent $R/prigent_data/Prigent_2005_roughness_0.25x0.25.nc --modis-lai $R/modis_lai --landcover $R/modis_landcover/modis_landcover_erodibility_2006.nc"

@@ -19,8 +19,8 @@ exactly, array sum 6.555398e-02 over all 744 x 361 x 576 values.
 
 Usage
 -----
-  python odem_regression.py --pin   --archive-root ODEM_DATA_ROOT
-  python odem_regression.py --check --archive-root ODEM_DATA_ROOT
+  python odem_regression.py --pin   --archive-root <data root>
+  python odem_regression.py --check --archive-root <data root>
   python odem_regression.py --compare-month new/odem_200601.nc ref/odem_200601.nc
 
 --pin writes odem_regression_pins.json. Regenerate it only deliberately, and never
