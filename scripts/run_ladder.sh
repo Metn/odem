@@ -6,10 +6,12 @@
 # Usage: bash scripts/run_ladder.sh   (from D:/coding_folder/Python/odem)
 set -eo pipefail
 R=ODEM_DATA_ROOT
+# MERRA-2 monthly inputs; override with M2_DIR=<internal copy> to keep reads off the external HDD
+M2=${M2_DIR:-$R/merra2_monthly_v2}
 COMMON="--scheme k14 --regrid conservative --soilgrids $R/soilgrids --prigent $R/prigent_data/Prigent_2005_roughness_0.25x0.25.nc --modis-lai $R/modis_lai --landcover $R/modis_landcover/modis_landcover_erodibility_2006.nc"
 run_one() {
   h=$1
-  python scripts/run_year.py --forcing merra2 --meteo-dir $R/merra2_monthly_v2 --year 2006 --workers 6 \
+  python scripts/run_year.py --forcing merra2 --meteo-dir $M2 --year 2006 --workers 6 \
       --out $R/output_v2/k14_m2_cons_2006_hold_$h -- $COMMON --hold $h \
       > $R/output_v2/ladder_$h.log 2>&1 && echo "hold $h done $(date +%H:%M)" || echo "hold $h FAILED"
 }
