@@ -55,6 +55,7 @@ from odem import (air_density, median_particle_diameter, compute_emission, CONST
                   ConservativeRegridder)
 from odem import (surface_state, flux_dead, dead_ustar_ft0, dead_fecan,
                   dead_saltation, dead_alpha, DEAD_CONST, SCHEMES)
+from odem import (InputData, DEAD_S_SOURCE, DEAD_T_BY_MAP, REGRID_FIELDS)
 
 
 # ===========================================================================
@@ -804,6 +805,84 @@ def test_dead(R):
         R.ok("DEAD error without 10 m wind", str(e)[:60])
 
 
+def test_v11_options(R):
+    """v1.1 run options: DEAD S-map selection and T by map, uniform clay,
+    per-static regrid overrides."""
+    import tempfile
+    print("\n[Level 1d] v1.1 run-option unit tests")
+    print("-" * 50)
+    D = DEAD_CONST
+
+    # 1. T follows the S-map provenance; the 2x2.5 value is the default.
+    ok = (DEAD_T_BY_MAP['2x25'] == 4.7586e-4 and DEAD_T_BY_MAP['025'] == 4.7376e-4
+          and D['T_default'] == DEAD_T_BY_MAP['2x25']
+          and sorted(DEAD_S_SOURCE['dead_g']) == ['025', '2x25']
+          and sorted(DEAD_S_SOURCE['dead_z']) == ['2x25'])
+    (R.ok if ok else R.fail)("DEAD T by S map (2x25 4.7586e-4 default, 025 4.7376e-4)",
+                             f"T={DEAD_T_BY_MAP}, maps g={sorted(DEAD_S_SOURCE['dead_g'])} "
+                             f"z={sorted(DEAD_S_SOURCE['dead_z'])}")
+
+    # 2. Uniform clay: GEOS-Chem's 20 percent gives alpha = 100 x 10^(13.4 x 0.2 - 6)
+    #    and w_t = 0.17 + 0.14 x 0.2 in every cell, whatever the SoilGrids clay.
+    met, static, lai = _make_dead_inputs(clay=5.0, swvl1=0.05)
+    state = surface_state(met, static, lai)
+    F20, d20 = flux_dead(met, static, state, clay_pct=20.0)
+    met2, static2, lai2 = _make_dead_inputs(clay=20.0, swvl1=0.05)
+    F20b, _ = flux_dead(met2, static2, surface_state(met2, static2, lai2))
+    a_hand = 100.0 * 10.0 ** (13.4 * 0.20 - 6.0)
+    _, wt = dead_fecan(np.array([[0.0]]), 0.20)
+    ok = (abs(float(d20['alpha'][0, 0]) - a_hand) / a_hand < 1e-12
+          and abs(float(wt[0, 0]) - 0.198) < 1e-12 and F20[0, 0] == F20b[0, 0] and F20[0, 0] > 0)
+    (R.ok if ok else R.fail)("DEAD uniform clay override (20 percent = SoilGrids clay 20)",
+                             f"alpha {float(d20['alpha'][0, 0]):.6e} vs hand {a_hand:.6e}, "
+                             f"w_t {float(wt[0, 0]):.3f}, F equal {F20[0, 0] == F20b[0, 0]}")
+
+    # 3. S-map selection reads the right file; dead_z has no 0.25 deg map.
+    lon = np.arange(-180.0, 180.0, 45.0); lat = np.array([-45.0, 0.0, 45.0])
+    with tempfile.TemporaryDirectory() as td:
+        for m, val in (('2x25', 0.2), ('025', 0.7)):
+            fn, var = DEAD_S_SOURCE['dead_g'][m]
+            with nc4.Dataset(os.path.join(td, fn), 'w') as ds:
+                ds.createDimension('lat', lat.size); ds.createDimension('lon', lon.size)
+                ds.createVariable('lat', 'f8', ('lat',))[:] = lat
+                ds.createVariable('lon', 'f8', ('lon',))[:] = lon
+                ds.createVariable(var, 'f4', ('lat', 'lon'))[:] = np.full((lat.size, lon.size), val)
+        got = {}
+        for m in ('2x25', '025'):
+            inp = InputData.__new__(InputData)
+            inp.dead_dir = Path(td); inp.dead_s_map = m
+            inp.regrid_method = 'nearest'; inp.regrid_fields = {}; inp._regridders = {}
+            inp.lon, inp.lat = lon, lat; inp.nlon, inp.nlat = lon.size, lat.size
+            got[m] = float(inp.load_dead_S('dead_g').mean())
+        inp.dead_s_map = '025'
+        try:
+            inp.load_dead_S('dead_z'); refused = False
+        except ValueError:
+            refused = True
+    ok = abs(got['2x25'] - 0.2) < 1e-6 and abs(got['025'] - 0.7) < 1e-6 and refused
+    (R.ok if ok else R.fail)("DEAD S-map selection (2x25 / 025 files; dead_z 025 refused)",
+                             f"S mean 2x25 {got['2x25']:.3f}, 025 {got['025']:.3f}, dead_z 025 refused {refused}")
+
+    # 4. Per-static regrid override: the named group goes conservative, the
+    #    others stay on the global method.
+    rng = np.random.default_rng(11)
+    s_lon = np.arange(-179.875, 180.0, 0.25); s_lat = np.arange(-89.875, 90.0, 0.25)
+    t_lon = np.arange(-180.0, 180.0, 0.625); t_lat = np.linspace(-90.0, 90.0, 361)
+    x = rng.random((s_lat.size, s_lon.size))
+    inp = InputData.__new__(InputData)
+    inp.regrid_method = 'nearest'; inp.regrid_fields = {'z0a': 'conservative'}; inp._regridders = {}
+    inp.lon, inp.lat = t_lon, t_lat; inp.nlon, inp.nlat = t_lon.size, t_lat.size
+    y_z0a = inp._regrid(s_lon, s_lat, x, fill=np.nan, field='z0a')
+    y_soil = inp._regrid(s_lon, s_lat, x, fill=np.nan, field='soil')
+    y_cons = ConservativeRegridder(s_lon, s_lat, t_lon, t_lat)(x, fill=np.nan)
+    y_near = inp._regrid_nearest(s_lon, s_lat, x, fill=np.nan)
+    ok = (np.array_equal(y_z0a, y_cons, equal_nan=True) and np.array_equal(y_soil, y_near, equal_nan=True)
+          and not np.array_equal(y_z0a, y_soil, equal_nan=True) and 'z0a' in REGRID_FIELDS)
+    (R.ok if ok else R.fail)("Per-static regrid override (z0a conservative, soil nearest)",
+                             f"z0a == conservative {np.array_equal(y_z0a, y_cons, equal_nan=True)}, "
+                             f"soil == nearest {np.array_equal(y_soil, y_near, equal_nan=True)}")
+
+
 def test_diagnostic_ranges(diag_file, R):
     """Check all diagnostic fields against physically defensible bounds."""
     print("\n[Level 2] Diagnostic Field Range Checks")
@@ -1389,6 +1468,7 @@ Examples:
         test_physics(R)
         test_regrid(R)
         test_dead(R)
+        test_v11_options(R)
 
     if args.diags:
         test_diagnostic_ranges(args.diags, R)

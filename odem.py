@@ -168,6 +168,9 @@ def median_particle_diameter(clay_frac, silt_frac, lai):
 # ===========================================================================
 
 REGRID_METHODS = ('nearest', 'conservative')
+# Static-input groups whose regrid method can be set on its own with
+# --regrid-field GROUP=METHOD (attribution runs); unset groups follow --regrid.
+REGRID_FIELDS = ('z0a', 'soil', 'f_erodible', 'lai', 'brdf', 'S')
 
 # netCDF-C chunk cache per variable, bytes (see InputData.__init__).
 NC_CHUNK_CACHE_BYTES = 200 * 1024 * 1024
@@ -402,7 +405,8 @@ class InputData:
 
     def __init__(self, meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
                  landcover_file=None, meteo_source='era5', brdf_file=None,
-                 regrid_method='nearest', dead_dir=None):
+                 regrid_method='nearest', dead_dir=None, regrid_fields=None,
+                 dead_s_map='2x25'):
         """meteo_path: ERA5 or MERRA-2 file/directory. meteo_source: 'era5' or 'merra2'.
         brdf_file: NetCDF of monthly MODIS BRDF omega_n (scripts/brdf_tif_to_nc.py),
         needed by the albedo-based scheme only.
@@ -417,6 +421,13 @@ class InputData:
             raise ValueError(f"Unknown regrid_method: {regrid_method!r} "
                              f"(use one of {REGRID_METHODS})")
         self.regrid_method = regrid_method
+        # Per-group overrides of regrid_method, e.g. {'z0a': 'conservative'}.
+        self.regrid_fields = dict(regrid_fields or {})
+        for g, m in self.regrid_fields.items():
+            if g not in REGRID_FIELDS or m not in REGRID_METHODS:
+                raise ValueError(f"bad regrid override {g}={m} (groups {REGRID_FIELDS}, "
+                                 f"methods {REGRID_METHODS})")
+        self.dead_s_map = dead_s_map
         self._regridders = {}  # {(src_lat bytes, src_lon bytes): ConservativeRegridder}
         # netCDF chunk cache (v2, 2026-09-24). The monthly meteo files are
         # chunked 186 timesteps deep (e.g. MERRA-2: 186 x 91 x 144, 9.7 MB per
@@ -695,7 +706,7 @@ class InputData:
         z0a_m[z0a_m <= 0] = np.nan
 
         # Regrid to ERA5 grid
-        self.z0a = self._regrid(p_lon, p_lat, z0a_m, fill=np.nan)
+        self.z0a = self._regrid(p_lon, p_lat, z0a_m, fill=np.nan, field='z0a')
 
         valid = self.z0a[np.isfinite(self.z0a) & (self.z0a > 0)]
         log.info(f"  z0a: {len(valid)} valid cells, "
@@ -762,9 +773,9 @@ class InputData:
         if len(src_lon) == self.nlon and len(src_lat) == self.nlat:
             return data
 
-        return self._regrid(src_lon, src_lat, data, fill=np.nan)
+        return self._regrid(src_lon, src_lat, data, fill=np.nan, field='soil')
 
-    def _regrid(self, src_lon, src_lat, data, fill=0.0):
+    def _regrid(self, src_lon, src_lat, data, fill=0.0, field=None):
         """Regrid a (lat, lon) source field onto the meteorology grid.
 
         Dispatches on self.regrid_method: 'nearest' is the original nearest
@@ -772,7 +783,8 @@ class InputData:
         method (ConservativeRegridder), with weights cached per source grid.
         Both treat NaN and values < -900 as missing.
         """
-        if self.regrid_method == 'conservative':
+        method = self.regrid_fields.get(field, self.regrid_method)
+        if method == 'conservative':
             return self._regrid_conservative(src_lon, src_lat, data, fill=fill)
         return self._regrid_nearest(src_lon, src_lat, data, fill=fill)
 
@@ -827,7 +839,7 @@ class InputData:
             f_erod = np.array(ds.variables['f_erodible'][:])
 
         # Regrid 0.05° → ERA5 grid
-        self.f_erodible = self._regrid(lc_lon, lc_lat, f_erod, fill=0.0)
+        self.f_erodible = self._regrid(lc_lon, lc_lat, f_erod, fill=0.0, field='f_erodible')
         self.f_erodible = np.clip(self.f_erodible, 0.0, 1.0)
 
         erod_cells = np.sum(self.f_erodible > 0)
@@ -909,7 +921,7 @@ class InputData:
         if len(lai_lon) == self.nlon and len(lai_lat) == self.nlat:
             lai_regridded = lai_data
         else:
-            lai_regridded = self._regrid(lai_lon, lai_lat, lai_data, fill=0.0)
+            lai_regridded = self._regrid(lai_lon, lai_lat, lai_data, fill=0.0, field='lai')
 
         self._lai_cache[nearest] = lai_regridded
         return lai_regridded
@@ -936,7 +948,7 @@ class InputData:
         if omega_n.shape == (self.nlat, self.nlon):
             omega_regrid = omega_n
         else:
-            omega_regrid = self._regrid(brdf_lon, brdf_lat, omega_n, fill=0.0)
+            omega_regrid = self._regrid(brdf_lon, brdf_lat, omega_n, fill=0.0, field='brdf')
         result = {'omega_n': omega_regrid}
         self._brdf_cache[month] = result
         valid = omega_regrid > 0
@@ -956,7 +968,11 @@ class InputData:
             raise ValueError(f"--scheme {scheme} needs --dead-inputs <dir> "
                              "(GEOS-Chem DUST_DEAD directory with "
                              "GOCART_src_fn.geos.2x25.nc and dst_tibds.geos.2x25.nc)")
-        fname, varname = DEAD_S_SOURCE[scheme]
+        maps = DEAD_S_SOURCE[scheme]
+        if self.dead_s_map not in maps:
+            raise ValueError(f"--dead-s-map {self.dead_s_map} is not available for {scheme} "
+                             f"(available: {sorted(maps)})")
+        fname, varname = maps[self.dead_s_map]
         fpath = self.dead_dir / fname
         if not fpath.exists():
             raise FileNotFoundError(f"DEAD input {fpath} not found")
@@ -969,7 +985,7 @@ class InputData:
             S_src = S_src[0]
         S_src = np.nan_to_num(S_src, nan=0.0)
         S_src = np.clip(S_src, 0.0, None)
-        self.S = self._regrid(s_lon, s_lat, S_src, fill=0.0)
+        self.S = self._regrid(s_lon, s_lat, S_src, fill=0.0, field='S')
         self.S = np.clip(np.nan_to_num(self.S, nan=0.0), 0.0, None)
         n_pos = int(np.sum(self.S > 0))
         log.info(f"  S ({varname}): source {S_src.shape} max={S_src.max():.4f}; "
@@ -1429,15 +1445,27 @@ DEAD_CONST = {
     # for the native 0.5x0.625 and 0.25x0.3125 grids, where GEOS-Chem reads
     # the offline DEAD emissions of Meng et al. (2021) instead. Those files
     # (HEMCO/OFFLINE_DUST/v2021-08, README of 23 April 2021) carry the
-    # MERRA-2 native-grid factor 4.7376e-4, which is the value used here.
-    'T_default':   4.7376e-4,
+    # MERRA-2 native-grid factor 4.7376e-4, calibrated with Meng's 0.25 deg
+    # Ginoux map. T follows the provenance of the S map (DEAD_T_BY_MAP) and is
+    # applied unchanged on every meteorology grid; T_default is the 2x2.5 value.
+    'T_default':   4.7586e-4,
 }
 
-# Erodibility map S per DEAD configuration: (file in --dead-inputs, variable).
+# Erodibility map S per DEAD configuration and map resolution:
+# {scheme: {map: (file in --dead-inputs, variable)}}. The 2x2.5 maps are
+# GEOS-Chem DUST_DEAD v2019-06 (identical fields to v2014-07); the 0.25 deg
+# Ginoux map is Jun Meng's GOCART_src_fn.geos.0.25x0.25.nc in the same
+# directory, the map behind the Meng et al. (2021) offline inventory. There is
+# no 0.25 deg Zender map.
 DEAD_S_SOURCE = {
-    'dead_g': ('GOCART_src_fn.geos.2x25.nc', 'GOC_SRC'),   # Ginoux et al. (2001)
-    'dead_z': ('dst_tibds.geos.2x25.nc', 'EF_GEO'),        # Zender et al. (2003b) geomorphic
+    'dead_g': {'2x25': ('GOCART_src_fn.geos.2x25.nc', 'GOC_SRC'),        # Ginoux et al. (2001)
+               '025':  ('GOCART_src_fn.geos.0.25x0.25.nc', 'GOC_SRC')},
+    'dead_z': {'2x25': ('dst_tibds.geos.2x25.nc', 'EF_GEO')},            # Zender et al. (2003b) geomorphic
 }
+DEAD_S_MAPS = ('2x25', '025')
+# T by S-map provenance: createRunDir.sh MERRA-2 2x2.5, and the Meng (2021)
+# README for the 0.25 deg map.
+DEAD_T_BY_MAP = {'2x25': 4.7586e-4, '025': 4.7376e-4}
 
 
 def dead_ustar_10m(u10, v10):
@@ -1650,7 +1678,13 @@ SCHEME_LABEL = {'k14': 'Kok et al. (2014) + Leung et al. (2023)',
 # Per-timestep inputs a scheme needs beyond met/static/state.
 SCHEME_STEP_INPUTS = {'aem': lambda inputs, t: {'brdf': inputs.get_brdf(t)}}
 # Label of the scheme of the current run, written to output file attributes.
-RUN_SCHEME = {'key': 'k14', 'label': SCHEME_LABEL['k14']}
+RUN_SCHEME = {'key': 'k14', 'label': SCHEME_LABEL['k14'], 'config': {}}
+
+
+def _write_run_config(ds):
+    """Run configuration as global attributes (odem_regrid, odem_dead_*, ...)."""
+    for k, v in RUN_SCHEME.get('config', {}).items():
+        ds.setncattr(f'odem_{k}', v)
 
 
 def compute_emission(met, static, lai, C_tune=0.05):
@@ -1717,6 +1751,7 @@ def _write_monthly(output_dir, ym, buf, lon, lat, all_times):
         ds.title = f'ODEM — Offline Dust Emission Model — {year}-{month:02d}'
         ds.source = RUN_SCHEME['label']
         ds.scheme = RUN_SCHEME['key']
+        _write_run_config(ds)
         ds.history = f'Created {datetime.now().isoformat()}'
 
 
@@ -1750,6 +1785,7 @@ def _write_annual_mean(filepath, lon, lat, F_mean, F_max, t_start, t_end, nt):
         ds.title = 'ODEM — Offline Dust Emission Model — annual mean'
         ds.source = RUN_SCHEME['label']
         ds.scheme = RUN_SCHEME['key']
+        _write_run_config(ds)
         ds.references = ('Leung et al. (2023) ACP 23:6487-6523; '
                          'Kok et al. (2014) ACP 14:13023-13041')
         ds.history = f'Created {datetime.now().isoformat()}'
@@ -1788,6 +1824,7 @@ def write_output(filepath, lon, lat, times, F_d_all):
         ds.title = 'ODEM — Offline Dust Emission Model'
         ds.source = RUN_SCHEME['label']
         ds.scheme = RUN_SCHEME['key']
+        _write_run_config(ds)
         ds.references = ('Leung et al. (2023) ACP 23:6487-6523; '
                          'Kok et al. (2014) ACP 14:13023-13041')
         ds.history = f'Created {datetime.now().isoformat()}'
@@ -1867,6 +1904,7 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
         ds.title = 'ODEM — Time-mean diagnostic fields'
         ds.source = RUN_SCHEME['label']
         ds.scheme = RUN_SCHEME['key']
+        _write_run_config(ds)
         ds.period = f'{t_start} to {t_end}'
         ds.n_timesteps = nt
         ds.history = f'Created {datetime.now().isoformat()}'
@@ -1876,7 +1914,8 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
               landcover_file=None, output_dir='output_v2', C_tune=0.05,
               save_diags=False, meteo_source='era5', scheme='k14',
               max_steps=None, brdf_file=None, regrid_method='nearest',
-              hold=(), dead_dir=None, dead_tuning=DEAD_CONST['T_default']):
+              hold=(), dead_dir=None, dead_tuning=None, regrid_fields=None,
+              dead_s_map='2x25', dead_clay_uniform=None):
     """Run ODEM — Offline Dust Emission Model.
 
     meteo_path:      ERA5 or MERRA-2 file/directory.
@@ -1891,7 +1930,13 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     regrid_method:   'nearest' (default) or 'conservative' for the static inputs
                      (Prigent z0a, SoilGrids, MODIS land cover, MODIS LAI, BRDF, S).
     dead_dir:        GEOS-Chem DUST_DEAD input directory, required by dead_g / dead_z.
-    dead_tuning:     DEAD global mass tuning factor T (FLX_MSS_FDG_FCT).
+    dead_tuning:     DEAD global mass tuning factor T (FLX_MSS_FDG_FCT); None
+                     takes DEAD_T_BY_MAP[dead_s_map].
+    regrid_fields:   {group: method} overrides of regrid_method per static
+                     group (REGRID_FIELDS), for attribution runs.
+    dead_s_map:      '2x25' (default) or '025' (Meng 0.25 deg Ginoux, dead_g only).
+    dead_clay_uniform: None (SoilGrids clay) or a clay percentage held uniform
+                     in DEAD (20 = GEOS-Chem's SOI_TXT_GET override).
     """
     if scheme not in SCHEMES:
         raise ValueError(f"unknown scheme '{scheme}'; choose from {sorted(SCHEMES)}")
@@ -1904,7 +1949,21 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
         raise ValueError(f"--scheme {scheme} needs --dead-inputs <dir> (GEOS-Chem "
                          "DUST_DEAD directory with GOCART_src_fn.geos.2x25.nc and "
                          "dst_tibds.geos.2x25.nc)")
+    if dead_tuning is None:
+        dead_tuning = DEAD_T_BY_MAP[dead_s_map]
+    regrid_fields = dict(regrid_fields or {})
     RUN_SCHEME['key'] = scheme
+    cfg = {'regrid': regrid_method}
+    if regrid_fields:
+        cfg['regrid_fields'] = ','.join(f'{g}={m}' for g, m in sorted(regrid_fields.items()))
+    if hold:
+        cfg['hold'] = ','.join(hold)
+    if scheme in DEAD_S_SOURCE:
+        cfg['dead_s_map'] = dead_s_map
+        cfg['dead_tuning'] = float(dead_tuning)
+        cfg['dead_clay'] = ('SoilGrids' if dead_clay_uniform is None
+                            else f'uniform {float(dead_clay_uniform):g} percent')
+    RUN_SCHEME['config'] = cfg
     RUN_SCHEME['label'] = SCHEME_LABEL[scheme] + (f" [held: {','.join(hold)}]" if hold else '')
     t0 = time.time()
 
@@ -1923,16 +1982,20 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     if hold:
         log.info(f"  Hold:       {', '.join(hold)} at neutral values")
     if scheme in DEAD_S_SOURCE:
-        log.info(f"  DEAD inputs: {dead_dir} ({DEAD_S_SOURCE[scheme][1]})")
+        log.info(f"  DEAD inputs: {dead_dir} (S map {dead_s_map}: "
+                 f"{DEAD_S_SOURCE[scheme].get(dead_s_map, ('?', '?'))[1]})")
+        log.info(f"  DEAD clay:  {cfg['dead_clay']}")
         log.info(f"  DEAD T:     {dead_tuning:.4e} (global mass tuning factor)")
-    log.info(f"  Regrid:     {regrid_method} (static inputs onto the meteo grid)")
+    log.info(f"  Regrid:     {regrid_method} (static inputs onto the meteo grid)"
+             + (f"; overrides {cfg['regrid_fields']}" if regrid_fields else ''))
     log.info("=" * 60)
 
     # Load inputs
     inputs = InputData(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
                        landcover_file=landcover_file, meteo_source=meteo_source,
                        brdf_file=brdf_file, regrid_method=regrid_method,
-                       dead_dir=dead_dir)
+                       dead_dir=dead_dir, regrid_fields=regrid_fields,
+                       dead_s_map=dead_s_map)
     inputs.load()
     if scheme in DEAD_S_SOURCE:
         inputs.load_dead_S(scheme)
@@ -1971,6 +2034,8 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
         scheme_kwargs = {'C_tune': C_tune, 'hold': hold}
     elif scheme in DEAD_S_SOURCE:
         scheme_kwargs = {'T': float(dead_tuning)}
+        if dead_clay_uniform is not None:
+            scheme_kwargs['clay_pct'] = float(dead_clay_uniform)
     else:
         scheme_kwargs = {}
     flux_fn = SCHEMES[scheme]
@@ -2147,9 +2212,18 @@ Examples:
     p.add_argument('--dead-inputs', default=None,
                    help='GEOS-Chem DUST_DEAD input directory (GOCART_src_fn.geos.2x25.nc, '
                         'dst_tibds.geos.2x25.nc); required for --scheme dead_g / dead_z')
-    p.add_argument('--dead-tuning', type=float, default=DEAD_CONST['T_default'],
-                   help='DEAD global mass tuning factor T (FLX_MSS_FDG_FCT); default '
-                        f"{DEAD_CONST['T_default']:.4e} (GEOS-Chem MERRA-2 native grid)")
+    p.add_argument('--dead-tuning', type=float, default=None,
+                   help='DEAD global mass tuning factor T (FLX_MSS_FDG_FCT); default by S map: '
+                        + ', '.join(f'{k} {v:.4e}' for k, v in DEAD_T_BY_MAP.items()))
+    p.add_argument('--dead-s-map', choices=DEAD_S_MAPS, default='2x25',
+                   help='DEAD erodibility map resolution: 2x25 (default, GEOS-Chem DUST_DEAD '
+                        'v2019-06) or 025 (Meng 0.25 deg Ginoux, dead_g only)')
+    p.add_argument('--dead-clay-uniform', type=float, default=None, metavar='PCT',
+                   help='Hold clay uniform at PCT percent in DEAD (20 = GEOS-Chem); '
+                        'default SoilGrids clay')
+    p.add_argument('--regrid-field', action='append', default=[], metavar='GROUP=METHOD',
+                   help='Override --regrid for one static group (repeatable); groups '
+                        f'{",".join(REGRID_FIELDS)}, methods {",".join(REGRID_METHODS)}')
     args = p.parse_args()
 
     if args.era5:
@@ -2176,6 +2250,9 @@ Examples:
         hold=tuple(h.strip() for h in args.hold.split(',') if h.strip()),
         dead_dir=args.dead_inputs,
         dead_tuning=args.dead_tuning,
+        regrid_fields=dict(kv.split('=', 1) for kv in args.regrid_field),
+        dead_s_map=args.dead_s_map,
+        dead_clay_uniform=args.dead_clay_uniform,
     )
 
 
