@@ -119,6 +119,8 @@ MERRA2_VARS = {
     'blh':   'PBLH',     # boundary layer height [m]       — M2T1NXFLX (optional)
     'swvl1': 'SFMC',     # surface soil moisture [m³/m³]   — M2T1NXLND
     'sd':    'SNODP',    # snow depth [m, actual]          — M2T1NXLND (NOT SHLAND=heat flux)
+    'u10':   'U10M',     # 10 m eastward wind [m/s]        — M2T1NXSLV or M2I1NXASM (v2, optional)
+    'v10':   'V10M',     # 10 m northward wind [m/s]       — M2T1NXSLV or M2I1NXASM (v2, optional)
 }
 # Land mask: derived in _load_merra2_grid() from SFMC validity (land cells have finite SFMC).
 # Snow note: MERRA-2 SNODP is actual snow depth (m); ERA5 sd is snow water equivalent (m).
@@ -168,14 +170,18 @@ class InputData:
     MODIS land cover, and SoilGrids data."""
 
     def __init__(self, meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
-                 landcover_file=None, meteo_source='era5'):
-        """meteo_path: ERA5 or MERRA-2 file/directory. meteo_source: 'era5' or 'merra2'."""
+                 landcover_file=None, meteo_source='era5', brdf_file=None):
+        """meteo_path: ERA5 or MERRA-2 file/directory. meteo_source: 'era5' or 'merra2'.
+        brdf_file: NetCDF of monthly MODIS BRDF omega_n (scripts/brdf_tif_to_nc.py),
+        needed by the albedo-based scheme only."""
         self.meteo_source = meteo_source
         self.era5_path = self.meteo_path = Path(meteo_path)
         self.soilgrids_dir = Path(soilgrids_dir)
         self.prigent_file = prigent_file
         self.modis_lai_dir = Path(modis_lai_dir)
         self.landcover_file = landcover_file
+        self.brdf_file = Path(brdf_file) if brdf_file else None
+        self._brdf_cache = {}  # {month: {'omega_n': array on the meteo grid}}
 
         # Multi-file meteo support (ERA5 or MERRA-2)
         self._era5_files = []      # list of (filepath, n_times) tuples
@@ -390,6 +396,10 @@ class InputData:
         # BLH is optional (for intermittency)
         if 'blh' in self._era5_ds.variables:
             fields['blh'] = self._read_era5('blh', tidx=local_tidx)
+        # 10 m winds are optional (v2 wind-driven schemes)
+        if 'u10' in self._era5_ds.variables and 'v10' in self._era5_ds.variables:
+            fields['u10'] = self._read_era5('u10', tidx=local_tidx)
+            fields['v10'] = self._read_era5('v10', tidx=local_tidx)
         return fields
 
     def _get_merra2_timestep(self, tidx):
@@ -413,6 +423,11 @@ class InputData:
         # BLH is optional
         if MERRA2_VARS['blh'] in self._era5_ds.variables:
             fields['blh'] = self._read_era5(MERRA2_VARS['blh'], tidx=local_tidx)
+        # 10 m winds are optional (v2 wind-driven schemes; prepare_merra2.py --wind-source)
+        if (MERRA2_VARS['u10'] in self._era5_ds.variables
+                and MERRA2_VARS['v10'] in self._era5_ds.variables):
+            fields['u10'] = self._read_era5(MERRA2_VARS['u10'], tidx=local_tidx)
+            fields['v10'] = self._read_era5(MERRA2_VARS['v10'], tidx=local_tidx)
         return fields
 
     def _load_prigent(self):
@@ -624,6 +639,36 @@ class InputData:
         self._lai_cache[nearest] = lai_regridded
         return lai_regridded
 
+    def get_brdf(self, dt):
+        """MODIS BRDF omega_n for the month of dt, on the meteorology grid.
+
+        Reads the monthly NetCDF written by scripts/brdf_tif_to_nc.py (variable
+        omega_n, dims month/lat/lon). Missing and negative values become 0 (no
+        sheltering information: ocean or no data), values are capped at 50, and
+        the field is regridded with the same method as the other statics.
+        """
+        month = dt.month if hasattr(dt, 'month') else int(str(dt)[5:7])
+        if month in self._brdf_cache:
+            return self._brdf_cache[month]
+        if self.brdf_file is None:
+            raise ValueError("the albedo-based scheme needs --modis-brdf <modis_brdf_YYYY.nc>")
+        with nc4.Dataset(self.brdf_file, 'r') as ds:
+            brdf_lon = np.array(ds.variables['lon'][:], dtype=np.float64)
+            brdf_lat = np.array(ds.variables['lat'][:], dtype=np.float64)
+            omega_n = np.array(ds.variables['omega_n'][month - 1, :, :]).astype(np.float64)
+        omega_n = np.nan_to_num(omega_n, nan=0.0)
+        omega_n = np.clip(omega_n, 0.0, 50.0)
+        if omega_n.shape == (self.nlat, self.nlon):
+            omega_regrid = omega_n
+        else:
+            omega_regrid = self._regrid(brdf_lon, brdf_lat, omega_n, fill=0.0)
+        result = {'omega_n': omega_regrid}
+        self._brdf_cache[month] = result
+        valid = omega_regrid > 0
+        log.info(f"  BRDF month {month:02d}: omega_n mean={omega_regrid[valid].mean():.2f}, "
+                 f"valid={int(valid.sum())} cells")
+        return result
+
     def close(self):
         if self._era5_ds:
             self._era5_ds.close()
@@ -634,23 +679,29 @@ class InputData:
 # Dust emission physics — Leung et al. (2023)
 # ===========================================================================
 
-def compute_emission(met, static, lai, C_tune=0.05):
+def surface_state(met, static, lai):
     """
-    Compute dust emission flux for a single timestep — Leung et al. (2023).
+    Shared surface state for every emission scheme (v2 split, 2026-09-24).
 
-    Implements Kok et al. (2014) emission with MB95+Okin drag partition.
+    Steps 1 to 11 of the v1.0 compute_emission(): land and snow mask, air
+    density, median particle diameter, dry fluid threshold (Shao and Lu, 2000),
+    impact threshold, Fecan et al. (1999) moisture correction, Marticorena and
+    Bergametti (1995) rock drag partition, Okin (2008) vegetation drag
+    partition, saltation friction velocity, bare-soil fraction and the
+    standardized fluid threshold. Every expression is unchanged from v1.0, so
+    the result is bitwise identical; the scheme-specific flux is computed
+    from this state by flux_kok14() and by the other schemes.
 
     Parameters
     ----------
-    met : dict — ERA5 fields {zust, swvl1, t2m, d2m, sp, sd, [blh]}
+    met : dict — ERA5 {zust, swvl1, t2m, d2m, sp, sd, [blh]} or MERRA-2
+          {zust, rhoa, swvl1, sd, [blh]}
     static : dict — {lsm, z0a, clay, silt, bulk_den, D_p, z0s, f_erodible}
     lai : ndarray (lat, lon) — MODIS LAI [m²/m²]
-    C_tune : float — global tuning constant
 
     Returns
     -------
-    F_d : ndarray (lat, lon) — dust emission flux [kg/m²/s]
-    diag : dict — diagnostic fields
+    state : dict of ndarray (lat, lon) fields, see the return statement.
     """
     C = CONST
 
@@ -754,6 +805,47 @@ def compute_emission(met, static, lai, C_tune=0.05):
     # ------------------------------------------------------------------
     ustar_st = ustar_ft_wet * np.sqrt(rhoa / C['rho_a0'])
 
+
+    return {
+        'mask': mask, 'rhoa': rhoa, 'D_p': D_p, 'z0s': z0s,
+        'ustar_ft0': ustar_ft0, 'ustar_it': ustar_it,
+        'f_moisture': f_moisture, 'ustar_ft_wet': ustar_ft_wet,
+        'clay_pct': clay_pct, 'z0a_valid': z0a_valid,
+        'f_eff_r': f_eff_r, 'f_eff_v': f_eff_v, 'F_eff': F_eff,
+        'wnd_frc_slt': wnd_frc_slt, 'f_bare': f_bare, 'ustar_st': ustar_st,
+    }
+
+
+def flux_kok14(met, static, state, C_tune=0.05):
+    """
+    Kok et al. (2014) emission flux, Leung et al. (2023) formulation, from a
+    surface state (v2 split, 2026-09-24). Steps 12 to 16 of the v1.0
+    compute_emission(): soil erodibility C_d, fragmentation exponent kappa,
+    clay scaling, turbulent intermittency eta (Comola et al., 2019) and the
+    flux equation. Expressions unchanged from v1.0.
+
+    Returns
+    -------
+    F_d : ndarray (lat, lon) — dust emission flux [kg/m²/s]
+    diag : dict — diagnostic fields (same keys as v1.0, plus clay_scale)
+    """
+    C = CONST
+    mask = state['mask']
+    rhoa = state['rhoa']
+    D_p = state['D_p']
+    ustar_ft0 = state['ustar_ft0']
+    ustar_it = state['ustar_it']
+    f_moisture = state['f_moisture']
+    ustar_ft_wet = state['ustar_ft_wet']
+    clay_pct = state['clay_pct']
+    z0a_valid = state['z0a_valid']
+    f_eff_r = state['f_eff_r']
+    f_eff_v = state['f_eff_v']
+    F_eff = state['F_eff']
+    wnd_frc_slt = state['wnd_frc_slt']
+    f_bare = state['f_bare']
+    ustar_st = state['ustar_st']
+
     # ------------------------------------------------------------------
     # 12. Soil erodibility coefficient C_d
     #     C_d = C_d0 × exp(-C_e × (u*_st - u*_st0) / u*_st0)
@@ -849,6 +941,160 @@ def compute_emission(met, static, lai, C_tune=0.05):
     return F_d, diag
 
 
+# ---------------------------------------------------------------------------
+# Albedo-based drag partition scheme (Chappell and Webb, 2016) with MB95
+# saltation. Reinstated in v2 from the development tree (2026-09-24); the
+# archived January 2006 development run (output_2006_aem) is its regression pin.
+# ---------------------------------------------------------------------------
+AEM_CONST = {
+    # u*_s/U_h as a function of rescaled normalised shadow omega_ns, fit from the
+    # Zenodo 5816911 Google Earth Engine implementation (Hennen and Chappell).
+    'aem_A':      0.0306,     # amplitude
+    'aem_C':      1.1202,     # exponent on omega_ns
+    'aem_D':      0.0125,     # denominator in the exponential argument
+    'aem_E':      0.0072,     # offset (minimum u*_s/U_h)
+    'aem_wn_max': 35.0,       # omega_n cap for rescaling (Marshall 1971 wind-tunnel range)
+    'aem_ns_min': 0.0001,     # rescaled omega_ns at a bare bright surface
+    'aem_ns_max': 0.1,        # rescaled omega_ns at a rough dark surface
+}
+
+AEM_SIZE_BINS = np.array([
+    # d [m],       u*_t [m/s]
+    [2.0e-6,       2.10],
+    [5.0e-6,       1.00],
+    [1.0e-5,       0.60],
+    [2.2e-5,       0.40],
+    [5.2e-5,       0.2127],
+    [9.0e-5,       0.22],
+    [1.25e-4,      0.25],
+    [2.50e-4,      0.31],
+    [5.00e-4,      0.40],
+    [1.00e-3,      0.55],
+])
+AEM_UST_T = AEM_SIZE_BINS[:, 1]  # threshold u*_t per bin
+
+
+def flux_aem(met, static, state, brdf):
+    """
+    Albedo-based drag partition (Chappell and Webb, 2016) with MB95 saltation
+    and the Marticorena (1999) clay sandblasting efficiency, from a surface
+    state. No global tuning constant (c = 1).
+
+    Physics chain:
+      1. MODIS BRDF omega_n -> rescale -> u*_s/U_h -> u*_s
+      2. MB95 saltation: Q = (rho_a/g) u*_s^3 sum_i E_f(d_i), 10 size bins,
+         Fecan moisture correction applied to each bin threshold
+      3. Vertical flux: F = f_bare Q alpha(clay)
+
+    brdf : dict — {'omega_n': array on the meteo grid} from InputData.get_brdf
+    Bare fraction is f_erodible x mask, without the LAI factor of the K14 chain,
+    because vegetation sheltering enters through the albedo here.
+    """
+    C = CONST
+    A = AEM_CONST
+    mask = state['mask']
+    rhoa = state['rhoa']
+    f_moisture = state['f_moisture']
+    clay_pct = state['clay_pct']
+
+    # 1. AEM drag partition -> u*_s
+    omega_n = brdf['omega_n']
+    wn_clipped = np.clip(omega_n, 0.0, A['aem_wn_max'])
+    omega_ns = (A['aem_ns_min']
+                + (A['aem_ns_max'] - A['aem_ns_min'])
+                * wn_clipped / A['aem_wn_max'])
+
+    ustar_ratio = (A['aem_A']
+                   * np.exp(-(omega_ns ** A['aem_C']) / A['aem_D'])
+                   + A['aem_E'])
+
+    if 'u10' in met and 'v10' in met:
+        U_10m = np.sqrt(met['u10'] ** 2 + met['v10'] ** 2)
+    else:
+        z0_fb = np.where(
+            np.isfinite(static['z0a']) & (static['z0a'] > 0),
+            static['z0a'], 3e-4)
+        U_10m = met['zust'] * np.log(10.0 / z0_fb) / C['k_vk']
+
+    wnd_frc_slt = ustar_ratio * U_10m
+
+    # 2. Bare soil fraction
+    f_bare = static['f_erodible'] * mask
+
+    # 3. MB95 saltation flux over 10 size bins
+    active = (wnd_frc_slt > AEM_UST_T.min()) & (mask > 0.5) & (f_bare > 0)
+    F_d = np.zeros_like(rhoa)
+
+    if np.any(active):
+        u_s = wnd_frc_slt[active]
+        rho_a = rhoa[active]
+        f_moist = f_moisture[active]
+
+        E_sum = np.zeros_like(u_s)
+        for u_t_bin in AEM_UST_T:
+            u_t = u_t_bin * f_moist
+            emitting = u_s > u_t
+            ratio = np.where(emitting, u_t / u_s, 1.0)
+            E_f = np.where(emitting,
+                           (1.0 + ratio) * (1.0 - ratio ** 2),
+                           0.0)
+            E_sum += E_f
+
+        Q = (rho_a / C['g']) * u_s ** 3 * E_sum
+
+        # alpha = 10^(0.134 clay% - 6), Marticorena (1999), clay capped at 20 %
+        clay_active = np.clip(clay_pct[active], 0.0, 20.0)
+        alpha = 10.0 ** (0.134 * clay_active - 6.0)
+
+        F_d[active] = f_bare[active] * Q * alpha
+
+    F_d = np.nan_to_num(F_d, nan=0.0, posinf=0.0, neginf=0.0)
+    F_d = np.clip(F_d, 0.0, None)
+
+    diag = {
+        'rhoa': rhoa, 'wnd_frc_slt': wnd_frc_slt,
+        'f_bare': f_bare, 'f_moisture': f_moisture,
+        'ustar_ratio': ustar_ratio, 'omega_ns': omega_ns,
+        'U_10m': U_10m,
+    }
+    return F_d, diag
+
+
+# Scheme registry (v2). Each flux function takes (met, static, state, **kwargs)
+# where state comes from surface_state(), and returns (F_d, diag).
+SCHEMES = {'k14': flux_kok14, 'aem': flux_aem}
+SCHEME_LABEL = {'k14': 'Kok et al. (2014) + Leung et al. (2023)',
+                'aem': 'Chappell and Webb (2016) albedo drag partition + MB95 saltation'}
+# Per-timestep inputs a scheme needs beyond met/static/state.
+SCHEME_STEP_INPUTS = {'aem': lambda inputs, t: {'brdf': inputs.get_brdf(t)}}
+# Label of the scheme of the current run, written to output file attributes.
+RUN_SCHEME = {'key': 'k14', 'label': SCHEME_LABEL['k14']}
+
+
+def compute_emission(met, static, lai, C_tune=0.05):
+    """
+    Compute dust emission flux for a single timestep — Leung et al. (2023).
+
+    Implements Kok et al. (2014) emission with MB95+Okin drag partition.
+    Since v2 this is surface_state() followed by flux_kok14(); the result is
+    bitwise identical to v1.0 (checked against the archived runs).
+
+    Parameters
+    ----------
+    met : dict — ERA5 fields {zust, swvl1, t2m, d2m, sp, sd, [blh]}
+    static : dict — {lsm, z0a, clay, silt, bulk_den, D_p, z0s, f_erodible}
+    lai : ndarray (lat, lon) — MODIS LAI [m²/m²]
+    C_tune : float — global tuning constant
+
+    Returns
+    -------
+    F_d : ndarray (lat, lon) — dust emission flux [kg/m²/s]
+    diag : dict — diagnostic fields
+    """
+    state = surface_state(met, static, lai)
+    return flux_kok14(met, static, state, C_tune)
+
+
 # ===========================================================================
 # Output writer
 # ===========================================================================
@@ -887,7 +1133,8 @@ def _write_monthly(output_dir, ym, buf, lon, lat, all_times):
         fd_v.long_name = 'Dust emission flux (Leung et al. 2023)'
 
         ds.title = f'ODEM — Offline Dust Emission Model — {year}-{month:02d}'
-        ds.source = 'Kok et al. (2014) + Leung et al. (2023)'
+        ds.source = RUN_SCHEME['label']
+        ds.scheme = RUN_SCHEME['key']
         ds.history = f'Created {datetime.now().isoformat()}'
 
 
@@ -919,7 +1166,8 @@ def _write_annual_mean(filepath, lon, lat, F_mean, F_max, t_start, t_end, nt):
         fx_v.long_name = 'Maximum dust emission flux'
 
         ds.title = 'ODEM — Offline Dust Emission Model — annual mean'
-        ds.source = 'Kok et al. (2014) + Leung et al. (2023)'
+        ds.source = RUN_SCHEME['label']
+        ds.scheme = RUN_SCHEME['key']
         ds.references = ('Leung et al. (2023) ACP 23:6487-6523; '
                          'Kok et al. (2014) ACP 14:13023-13041')
         ds.history = f'Created {datetime.now().isoformat()}'
@@ -956,7 +1204,8 @@ def write_output(filepath, lon, lat, times, F_d_all):
         fd_v.long_name = 'Dust emission flux (Leung et al. 2023)'
 
         ds.title = 'ODEM — Offline Dust Emission Model'
-        ds.source = 'Kok et al. (2014) + Leung et al. (2023)'
+        ds.source = RUN_SCHEME['label']
+        ds.scheme = RUN_SCHEME['key']
         ds.references = ('Leung et al. (2023) ACP 23:6487-6523; '
                          'Kok et al. (2014) ACP 14:13023-13041')
         ds.history = f'Created {datetime.now().isoformat()}'
@@ -1006,7 +1255,9 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
         lon_v[:] = lon; lon_v.units = 'degrees_east'
 
         for name, arr_sum in diag_sums.items():
-            lname, units = DIAG_META[name]
+            if name in static:
+                continue  # the static field of that name is written below
+            lname, units = DIAG_META.get(name, (name, '1'))
             v = ds.createVariable(name, 'f4', ('lat', 'lon'), zlib=True, complevel=4)
             v[:] = arr_sum / nt
             v.long_name = lname; v.units = units
@@ -1022,7 +1273,8 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
             v.missing_value = np.float32(-9999.0)
 
         ds.title = 'ODEM — Time-mean diagnostic fields'
-        ds.source = 'Kok et al. (2014) + Leung et al. (2023)'
+        ds.source = RUN_SCHEME['label']
+        ds.scheme = RUN_SCHEME['key']
         ds.period = f'{t_start} to {t_end}'
         ds.n_timesteps = nt
         ds.history = f'Created {datetime.now().isoformat()}'
@@ -1030,13 +1282,23 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
 
 def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
               landcover_file=None, output_dir='output_v2', C_tune=0.05,
-              save_diags=False, meteo_source='era5'):
+              save_diags=False, meteo_source='era5', scheme='k14',
+              max_steps=None, brdf_file=None):
     """Run ODEM — Offline Dust Emission Model.
 
     meteo_path:      ERA5 or MERRA-2 file/directory.
     meteo_source:    'era5' (default) or 'merra2'
     save_diags:      if True, write odem_diag_mean.nc with time-mean diagnostic fields.
+    scheme:          emission scheme key in SCHEMES ('k14' = v1.0 physics).
+    max_steps:       if set, stop after this many timesteps (development and
+                     regression runs only; the outputs then cover a partial month).
     """
+    if scheme not in SCHEMES:
+        raise ValueError(f"unknown scheme '{scheme}'; choose from {sorted(SCHEMES)}")
+    if scheme == 'aem' and not brdf_file:
+        raise ValueError("--scheme aem needs --modis-brdf <modis_brdf_YYYY.nc>")
+    RUN_SCHEME['key'] = scheme
+    RUN_SCHEME['label'] = SCHEME_LABEL[scheme]
     t0 = time.time()
 
     log.info("=" * 60)
@@ -1048,11 +1310,15 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     log.info(f"  Land cover: {landcover_file or 'NONE (all land emits)'}")
     log.info(f"  SoilGrids:  {soilgrids_dir}")
     log.info(f"  C_tune:     {C_tune}")
+    log.info(f"  Scheme:     {scheme} ({SCHEME_LABEL.get(scheme, scheme)})")
+    if brdf_file:
+        log.info(f"  MODIS BRDF: {brdf_file}")
     log.info("=" * 60)
 
     # Load inputs
     inputs = InputData(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
-                       landcover_file=landcover_file, meteo_source=meteo_source)
+                       landcover_file=landcover_file, meteo_source=meteo_source,
+                       brdf_file=brdf_file)
     inputs.load()
 
     # Precompute static fields
@@ -1080,31 +1346,38 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     F_d_sum = np.zeros((inputs.nlat, inputs.nlon), dtype=np.float64)
     F_d_max = np.zeros((inputs.nlat, inputs.nlon), dtype=np.float32)
 
-    # Diagnostic accumulators (only allocated if save_diags=True)
-    DIAG_KEYS = ['rhoa', 'ustar_ft0', 'ustar_ft_wet', 'ustar_it', 'wnd_frc_slt',
-                 'f_bare', 'f_eff_r', 'f_eff_v', 'F_eff', 'kappa', 'C_d', 'eta',
-                 'f_moisture']
-    diag_sums = {k: np.zeros((inputs.nlat, inputs.nlon), dtype=np.float64)
-                 for k in DIAG_KEYS} if save_diags else {}
+    # Diagnostic accumulators (only allocated if save_diags=True); the key set
+    # is whatever the scheme returns, taken from the first timestep.
+    diag_sums = {}
+    scheme_kwargs = {'C_tune': C_tune} if scheme == 'k14' else {}
+    flux_fn = SCHEMES[scheme]
+    step_inputs = SCHEME_STEP_INPUTS.get(scheme, lambda inputs_, t_: {})
+    n_steps = inputs.nt if max_steps is None else min(inputs.nt, int(max_steps))
+    if n_steps != n_steps:
+        log.warning(f"  max_steps: running {n_steps} of {n_steps} timesteps")
 
     # For monthly output files: group timesteps by month
     monthly_bufs = {}  # {(year,month): [list of F_d arrays]}
 
-    for tidx in range(inputs.nt):
+    for tidx in range(n_steps):
         t = inputs.times[tidx]
         t_str = str(t)
         if tidx % 8 == 0:
-            log.info(f"  [{tidx+1}/{inputs.nt}] {t_str}")
+            log.info(f"  [{tidx+1}/{n_steps}] {t_str}")
 
         met = inputs.get_timestep(tidx)
         lai = inputs.get_modis_lai(t)
-        F_d, diag = compute_emission(met, static, lai, C_tune)
+        state = surface_state(met, static, lai)
+        F_d, diag = flux_fn(met, static, state, **scheme_kwargs, **step_inputs(inputs, t))
 
         F_d_sum += F_d
         F_d_max = np.maximum(F_d_max, F_d)
 
         if save_diags:
-            for k in DIAG_KEYS:
+            if not diag_sums:
+                diag_sums = {k: np.zeros((inputs.nlat, inputs.nlon), dtype=np.float64)
+                             for k in diag}
+            for k in diag_sums:
                 diag_sums[k] += diag[k]
 
         # Buffer for monthly output
@@ -1121,9 +1394,9 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
             if n_active > 0:
                 log.info(f"    F_d: mean={F_d[active].mean():.2e}, "
                          f"max={F_d.max():.2e} kg/m²/s")
-                log.info(f"    f_eff_r: mean={diag['f_eff_r'][active].mean():.3f}")
-                log.info(f"    f_eff_v: mean={diag['f_eff_v'][active].mean():.3f}")
-                log.info(f"    eta: mean={diag['eta'][active].mean():.3f}")
+                for k in ('f_eff_r', 'f_eff_v', 'eta', 'ustar_ratio', 'U_10m'):
+                    if k in diag:
+                        log.info(f"    {k}: mean={diag[k][active].mean():.3f}")
 
         # Write completed months to disk to free memory
         completed = [k for k in monthly_bufs
@@ -1144,7 +1417,7 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     # global budget from it, so gating the assignment on n_months made every
     # single-month run (including both README quick-start examples) die with
     # UnboundLocalError after the output had already been written.
-    F_mean = F_d_sum / inputs.nt  # kg/m²/s
+    F_mean = F_d_sum / n_steps  # kg/m²/s
 
     # Annual mean output — only written for multi-month runs.
     # Single-month runs would overwrite a valid annual mean with one month's data.
@@ -1152,7 +1425,7 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     if n_months > 1:
         out_file = os.path.join(output_dir, 'odem_annual_mean.nc')
         _write_annual_mean(out_file, inputs.lon, inputs.lat, F_mean, F_d_max,
-                           inputs.times[0], inputs.times[-1], inputs.nt)
+                           inputs.times[0], inputs.times[-1], n_steps)
     else:
         log.info("  Skipping annual mean file (single-month run)")
 
@@ -1160,7 +1433,7 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     if save_diags:
         diag_file = os.path.join(output_dir, 'odem_diag_mean.nc')
         _write_diag_mean(diag_file, inputs.lon, inputs.lat, diag_sums,
-                         static, inputs.nt, inputs.times[0], inputs.times[-1])
+                         static, n_steps, inputs.times[0], inputs.times[-1])
 
     # Summary
     elapsed = time.time() - t0
@@ -1233,6 +1506,13 @@ Examples:
                    help='Save time-mean diagnostic fields to odem_diag_mean.nc '
                         '(recommended for verification runs)')
 
+    p.add_argument('--scheme', default='k14', choices=sorted(SCHEMES),
+                   help='Emission scheme (default k14 = Kok 2014 / Leung 2023, the v1.0 physics)')
+    p.add_argument('--max-steps', type=int, default=None,
+                   help='Development only: stop after N timesteps (partial-month output)')
+    p.add_argument('--modis-brdf', default=None,
+                   help='Monthly MODIS BRDF omega_n NetCDF (scripts/brdf_tif_to_nc.py); '
+                        'required for --scheme aem')
     args = p.parse_args()
 
     if args.era5:
@@ -1252,6 +1532,9 @@ Examples:
         C_tune=args.C_tune,
         save_diags=args.save_diags,
         meteo_source=meteo_source,
+        scheme=args.scheme,
+        max_steps=args.max_steps,
+        brdf_file=args.modis_brdf,
     )
 
 
