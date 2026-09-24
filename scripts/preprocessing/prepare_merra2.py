@@ -72,6 +72,14 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 FLX_VARS = ['USTAR', 'RHOA', 'PBLH', 'DISPH']  # from M2T1NXFLX
 LND_VARS = ['SFMC', 'SNODP']                   # from M2T1NXLND
+WND_VARS = ['U10M', 'V10M']                    # 10 m winds, added 2026-09-24 for the
+                                               # ODEM v2 wind-driven schemes; from
+                                               # slv (tavg1, hourly mean) or asm
+                                               # (inst1, instantaneous) per --wind-source
+
+# collection short name -> full collection id in the daily file name
+COLL_FULL = {'flx': 'tavg1_2d_flx_Nx', 'lnd': 'tavg1_2d_lnd_Nx',
+             'slv': 'tavg1_2d_slv_Nx', 'asm': 'inst1_2d_asm_Nx'}
 
 FILL_VALUE = 1.0e15   # MERRA-2 fill value for missing/ocean cells
 
@@ -84,7 +92,7 @@ def find_daily_file(merra2_dir, collection_short, date_str):
     collection_short: 'flx' or 'lnd'
     date_str: 'YYYYMMDD'
     """
-    coll_full = f'tavg1_2d_{collection_short}_Nx'
+    coll_full = COLL_FULL[collection_short]
     sub = Path(merra2_dir) / collection_short
     patterns = [
         f'MERRA2_*.{coll_full}.{date_str}.nc4',
@@ -118,7 +126,7 @@ def read_daily(filepath, varnames):
     return result
 
 
-def merge_month(merra2_dir, year, month, output_dir):
+def merge_month(merra2_dir, year, month, output_dir, wind_source=None):
     """
     Merge all daily MERRA-2 files for a given year/month into one NetCDF.
 
@@ -133,6 +141,7 @@ def merge_month(merra2_dir, year, month, output_dir):
     # Collect daily arrays
     all_flx = {v: [] for v in FLX_VARS}
     all_lnd = {v: [] for v in LND_VARS}
+    all_wnd = {v: [] for v in WND_VARS}
     times_all = []   # hours since 1901-01-01 (CF convention)
     ref_date = date(1901, 1, 1)
     n_found = 0
@@ -150,6 +159,15 @@ def merge_month(merra2_dir, year, month, output_dir):
 
         flx = read_daily(flx_path, FLX_VARS)
         lnd = read_daily(lnd_path, LND_VARS)
+        if wind_source:
+            wnd_path = find_daily_file(merra2_dir, wind_source, date_str)
+            if wnd_path is None:
+                log.error(f"  {date_str}: missing {wind_source} wind file; aborting month")
+                return None
+            wnd = read_daily(wnd_path, WND_VARS)
+            for v in WND_VARS:
+                if v in wnd:
+                    all_wnd[v].append(wnd[v])
 
         # Record times: hours since ref_date for each of the 24 hours
         d0 = date(year, month, day)
@@ -180,6 +198,9 @@ def merge_month(merra2_dir, year, month, output_dir):
     for v in LND_VARS:
         if all_lnd[v]:
             merged[v] = np.concatenate(all_lnd[v], axis=0)
+    for v in WND_VARS:
+        if all_wnd[v]:
+            merged[v] = np.concatenate(all_wnd[v], axis=0)
 
     # Get grid from first available array
     first_arr = next(iter(merged.values()))
@@ -193,11 +214,12 @@ def merge_month(merra2_dir, year, month, output_dir):
 
     # Write output
     _write_monthly(out_file, merged, lat, lon, np.array(times_all, dtype=np.float64),
-                   year, month, n_found)
+                   year, month, n_found, wind_source=wind_source)
     return str(out_file)
 
 
-def _write_monthly(out_file, merged, lat, lon, times, year, month, n_days_found):
+def _write_monthly(out_file, merged, lat, lon, times, year, month, n_days_found,
+                   wind_source=None):
     """Write merged monthly NetCDF file."""
     nt = len(times)
     nlat = len(lat)
@@ -211,6 +233,8 @@ def _write_monthly(out_file, merged, lat, lon, times, year, month, n_days_found)
         'DISPH': ('Displacement height (land mask)',   'm'),
         'SFMC':  ('Surface soil moisture',            'm3 m-3'),
         'SNODP': ('Snow depth',                       'm'),
+        'U10M':  ('10 m eastward wind',               'm s-1'),
+        'V10M':  ('10 m northward wind',              'm s-1'),
     }
 
     with nc4.Dataset(str(out_file), 'w', format='NETCDF4') as ds:
@@ -247,8 +271,13 @@ def _write_monthly(out_file, merged, lat, lon, times, year, month, n_days_found)
 
         # Global attributes
         ds.title = f'MERRA-2 dust emission inputs {year}-{month:02d}'
-        ds.source = ('M2T1NXFLX.5.12.4 (USTAR, RHOA, PBLH), '
-                     'M2T1NXLND.5.12.4 (SFMC, SNODP)')
+        ds.source = ('M2T1NXFLX.5.12.4 (USTAR, RHOA, PBLH, DISPH), '
+                     'M2T1NXLND.5.12.4 (SFMC, SNODP)'
+                     + (', M2T1NXSLV.5.12.4 (U10M, V10M; 1-hour means stamped :30, relabelled to the hour)'
+                        if wind_source == 'slv' else '')
+                     + (', M2I1NXASM.5.12.4 (U10M, V10M; instantaneous on the hour)'
+                        if wind_source == 'asm' else ''))
+        ds.wind_source = wind_source or 'none'
         ds.resolution = '0.5 deg lat x 0.625 deg lon'
         ds.days_found = n_days_found
         ds.timesteps = nt
@@ -285,6 +314,9 @@ Examples:
     p.add_argument('--output-dir', required=True,
                    help='Output directory for merra2_dust_YYYYMM.nc files')
     p.add_argument('--year', type=int, required=True)
+    p.add_argument('--wind-source', choices=['slv', 'asm'], default=None,
+                   help='Also merge 10 m winds U10M, V10M from slv/ (tavg1 hourly means) '
+                        'or asm/ (inst1 instantaneous) daily files (ODEM v2 wind-driven schemes)')
     p.add_argument('--month', type=int, default=None,
                    help='Month 1-12 (omit for full year)')
 
@@ -293,7 +325,8 @@ Examples:
     months = [args.month] if args.month else list(range(1, 13))
 
     for m in months:
-        out = merge_month(args.merra2_dir, args.year, m, args.output_dir)
+        out = merge_month(args.merra2_dir, args.year, m, args.output_dir,
+                          wind_source=args.wind_source)
         if out:
             log.info(f"  → {out}")
 
