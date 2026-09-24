@@ -169,6 +169,9 @@ def median_particle_diameter(clay_frac, silt_frac, lai):
 
 REGRID_METHODS = ('nearest', 'conservative')
 
+# netCDF-C chunk cache per variable, bytes (see InputData.__init__).
+NC_CHUNK_CACHE_BYTES = 200 * 1024 * 1024
+
 
 def _cell_edges(centres, clip=None):
     """Cell edges of a monotonically increasing 1-D cell-centre axis.
@@ -405,6 +408,14 @@ class InputData:
                              f"(use one of {REGRID_METHODS})")
         self.regrid_method = regrid_method
         self._regridders = {}  # {(src_lat bytes, src_lon bytes): ConservativeRegridder}
+        # netCDF chunk cache (v2, 2026-09-24). The monthly meteo files are
+        # chunked 186 timesteps deep (e.g. MERRA-2: 186 x 91 x 144, 9.7 MB per
+        # chunk, 16 chunks per hourly slab), so with the 16 MB library default
+        # every hourly read decompresses the whole chunk row again (about 0.5 s
+        # per variable and step). A cache that holds one chunk row per variable
+        # makes the next 185 reads free. Numerically neutral. Applies to files
+        # opened after this call; the limit is per variable, not per file.
+        nc4.set_chunk_cache(size=NC_CHUNK_CACHE_BYTES, nelems=4133, preemption=0.75)
         self.era5_path = self.meteo_path = Path(meteo_path)
         self.soilgrids_dir = Path(soilgrids_dir)
         self.prigent_file = prigent_file
