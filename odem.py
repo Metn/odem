@@ -555,7 +555,7 @@ class InputData:
         if 'DISPH' in ds0.variables:
             disph_raw = np.array(ds0.variables['DISPH'][0])  # first timestep
             disph_raw = np.where(np.abs(disph_raw) > 1e10, np.nan, disph_raw)
-            self.lsm = np.where(np.isfinite(disph_raw) & (disph_raw >= 0), 1.0, 0.0)
+            self.lsm = np.where(np.isfinite(disph_raw) & (disph_raw > 0), 1.0, 0.0)
             log.info(f"  LSM from DISPH: {int(self.lsm.sum())} land cells")
         else:
             sfmc_var = MERRA2_VARS['swvl1']  # 'SFMC'
