@@ -53,6 +53,8 @@ import matplotlib.gridspec as gridspec
 sys.path.insert(0, str(Path(__file__).parent))
 from odem import (air_density, median_particle_diameter, compute_emission, CONST,
                   ConservativeRegridder)
+from odem import (surface_state, flux_dead, dead_ustar_ft0, dead_fecan,
+                  dead_saltation, dead_alpha, DEAD_CONST, SCHEMES)
 
 
 # ===========================================================================
@@ -599,6 +601,175 @@ DIAG_EXPECTED = {
     'f_moisture':   (1.0,    20.0,   'Fécan factor [-]',              '≥1 always (only increases threshold)'),
     'D_p':          (9e-6,   132e-6, 'Particle diameter [m]',         'clipped [10µm, 500µm]; arid cap 127µm'),
 }
+
+
+# ===========================================================================
+# Level 1c: DEAD scheme unit tests (GEOS-Chem configuration of Zender 2003a)
+# ===========================================================================
+
+def _make_dead_inputs(u10=8.0, v10=0.0, swvl1=0.01, clay=5.0, S=0.5,
+                      f_erodible=0.8, lsm=1.0, snow=0.0, lai=0.1):
+    """1x1 cell inputs for the DEAD scheme: the k14 1-cell helper plus the
+    10 m wind and the erodibility map S."""
+    met, static, lai_arr = _make_1cell_inputs(swvl1=swvl1, snow=snow, clay=clay,
+                                              f_erodible=f_erodible, lsm=lsm, lai=lai)
+    met['u10'] = np.array([[u10]])
+    met['v10'] = np.array([[v10]])
+    static['S'] = np.array([[S]])
+    return met, static, lai_arr
+
+
+def _run_dead(met, static, lai, **kw):
+    state = surface_state(met, static, lai)
+    return flux_dead(met, static, state, **kw)
+
+
+def test_dead(R):
+    """DEAD scheme: thresholds, saltation, sandblasting, scaling and masks."""
+    print("\n[Level 1c] DEAD scheme unit tests")
+    print("-" * 50)
+    D = DEAD_CONST
+
+    # ------------------------------------------------------------------
+    # 1. Iversen and White (1982) threshold at D_p = 75 um, rho_a = 1.225.
+    #    Independent hand evaluation of Zhang 2025 Eqs. A5 to A7 with the
+    #    Fortran constants: Re = 0.38 + 1331 (100 D)^1.56 = 1.024575,
+    #    B = 1 + 6e-7 / (rho_p g D^2.5) = 1.473949,
+    #    G = 1.928 Re^0.0922 - 1 = 0.932321,
+    #    u*ft0 = 0.129 sqrt(B/G) sqrt(rho_p g D / rho_a) = 0.204595 m/s.
+    # ------------------------------------------------------------------
+    rho_p, g, Dp, rho_a = 2650.0, 9.80665, 75e-6, 1.225
+    Re_hand = 0.38 + 1331.0 * (100.0 * Dp) ** 1.56
+    B_hand = 1.0 + 6.0e-7 / (rho_p * g * Dp ** 2.5)
+    G_hand = 1.928 * Re_hand ** 0.0922 - 1.0
+    ut_hand = 0.129 * np.sqrt(B_hand / G_hand) * np.sqrt(rho_p * g * Dp / rho_a)
+    ut_code = float(dead_ustar_ft0(np.array([[rho_a]]))[0, 0])
+    if abs(ut_code - ut_hand) < 1e-9 and abs(ut_hand - 0.204595) < 1e-5:
+        R.ok("DEAD Iversen-White u*ft0 (75 um, 1.225 kg/m3)",
+             f"code {ut_code:.6f} = hand {ut_hand:.6f} m/s (Re={Re_hand:.4f})")
+    else:
+        R.fail("DEAD Iversen-White u*ft0", f"code {ut_code:.6f}, hand {ut_hand:.6f}")
+
+    # ------------------------------------------------------------------
+    # 2. Fecan factor: 1 below w_t, A8 value above it, for f_clay = 0.10
+    #    (w_t = 0.17 + 0.14 x 0.10 = 0.184 in the Fortran).
+    # ------------------------------------------------------------------
+    f_clay = 0.10
+    w_t = 0.17 + 0.14 * f_clay
+    fm_dry, wt_code = dead_fecan(np.array([[w_t - 0.01]]), np.array([[f_clay]]))
+    fm_wet, _ = dead_fecan(np.array([[w_t + 0.05]]), np.array([[f_clay]]))
+    fm_hand = np.sqrt(1.0 + 1.21 * (100.0 * 0.05) ** 0.68)
+    if (fm_dry[0, 0] == 1.0 and abs(wt_code[0, 0] - w_t) < 1e-12
+            and abs(fm_wet[0, 0] - fm_hand) < 1e-12):
+        R.ok("DEAD Fecan factor", f"f_m=1 below w_t={w_t:.3f}; "
+             f"f_m({w_t + 0.05:.3f})={fm_wet[0, 0]:.6f} = A8 value {fm_hand:.6f}")
+    else:
+        R.fail("DEAD Fecan factor",
+               f"dry {fm_dry[0, 0]}, wet {fm_wet[0, 0]:.6f} vs {fm_hand:.6f}, w_t {wt_code[0, 0]}")
+
+    # ------------------------------------------------------------------
+    # 3. White 1979 saltation: zero at and below u*ft, positive above, and
+    #    the closed form at one hand-evaluated u*s (0.4 m/s, u*ft 0.2 m/s).
+    # ------------------------------------------------------------------
+    rho = np.array([[1.2]])
+    uft = np.array([[0.2]])
+    q_below = dead_saltation(rho, np.array([[0.15]]), uft)[0, 0]
+    q_at = dead_saltation(rho, np.array([[0.2]]), uft)[0, 0]
+    q_above = dead_saltation(rho, np.array([[0.4]]), uft)[0, 0]
+    r = 0.2 / 0.4
+    q_hand = 2.61 * 1.2 / 9.80665 * 0.4 ** 3 * (1.0 - r) * (1.0 + r) ** 2
+    if q_below == 0.0 and q_at == 0.0 and q_above > 0 and abs(q_above - q_hand) < 1e-15:
+        R.ok("DEAD White 1979 saltation flux",
+             f"Q(0.15)=0, Q(0.20)=0, Q(0.40)={q_above:.6e} = hand {q_hand:.6e} kg/m/s")
+    else:
+        R.fail("DEAD White 1979 saltation flux",
+               f"below {q_below}, at {q_at}, above {q_above:.6e} vs {q_hand:.6e}")
+
+    # ------------------------------------------------------------------
+    # 4. F_d proportional to S and to T (doubling either doubles the flux).
+    # ------------------------------------------------------------------
+    met, static, lai = _make_dead_inputs(u10=10.0, S=0.5)
+    F1, d1 = _run_dead(met, static, lai)
+    F_S2, _ = _run_dead(met, static, lai, S=np.array([[1.0]]))
+    F_T2, _ = _run_dead(met, static, lai, T=2.0 * D['T_default'])
+    if F1[0, 0] > 0 and F_S2[0, 0] == 2.0 * F1[0, 0] and F_T2[0, 0] == 2.0 * F1[0, 0]:
+        R.ok("DEAD F_d linear in S and T",
+             f"F={F1[0, 0]:.3e}; 2S -> x{F_S2[0, 0] / F1[0, 0]:.6f}, 2T -> x{F_T2[0, 0] / F1[0, 0]:.6f}")
+    else:
+        R.fail("DEAD F_d linear in S and T",
+               f"F={F1[0, 0]:.3e}, 2S {F_S2[0, 0]:.3e}, 2T {F_T2[0, 0]:.3e}")
+
+    # ------------------------------------------------------------------
+    # 5. alpha at 5, 20 and 40 percent clay: 100 x 10^(13.4 f_clay - 6) m-1,
+    #    with the Fortran cap min(f_clay, 0.20), so 40 % equals 20 %.
+    # ------------------------------------------------------------------
+    a5, a20, a40 = (float(dead_alpha(np.array([[c]]))[0, 0]) for c in (5.0, 20.0, 40.0))
+    a5_hand = 100.0 * 10.0 ** (13.4 * 0.05 - 6.0)
+    a20_hand = 100.0 * 10.0 ** (13.4 * 0.20 - 6.0)
+    if abs(a5 - a5_hand) < 1e-15 and abs(a20 - a20_hand) < 1e-12 and a40 == a20:
+        R.ok("DEAD MB95 alpha (clay 5/20/40 %)",
+             f"{a5:.4e}, {a20:.4e}, {a40:.4e} m-1; 40 % = 20 % (cap)")
+    else:
+        R.fail("DEAD MB95 alpha", f"{a5:.4e} vs {a5_hand:.4e}, {a20:.4e} vs {a20_hand:.4e}, {a40:.4e}")
+
+    # ------------------------------------------------------------------
+    # 6. F_d = 0 wherever mask = 0 (ocean or snow), f_bare = 0 or S = 0.
+    # ------------------------------------------------------------------
+    cases = {
+        'ocean (lsm=0)':      _make_dead_inputs(u10=10.0, lsm=0.0),
+        'snow (sd=0.05)':     _make_dead_inputs(u10=10.0, snow=0.05),
+        'f_erodible=0':       _make_dead_inputs(u10=10.0, f_erodible=0.0),
+        'LAI=2 (f_bare=0)':   _make_dead_inputs(u10=10.0, lai=2.0),
+        'S=0':                _make_dead_inputs(u10=10.0, S=0.0),
+    }
+    zeros = {k: float(_run_dead(*v)[0][0, 0]) for k, v in cases.items()}
+    if all(z == 0.0 for z in zeros.values()) and F1[0, 0] > 0:
+        R.ok("DEAD F_d = 0 for mask/f_bare/S = 0", ", ".join(zeros))
+    else:
+        R.fail("DEAD F_d = 0 for mask/f_bare/S = 0", str(zeros))
+
+    # ------------------------------------------------------------------
+    # 7. dead_g and dead_z are the same function of S: identical F_d for the
+    #    same S array (pure S dependence, nothing keyed on the scheme name).
+    # ------------------------------------------------------------------
+    met, static, lai = _make_dead_inputs(u10=9.0, S=0.3)
+    state = surface_state(met, static, lai)
+    Fg, _ = SCHEMES['dead_g'](met, static, state)
+    Fz, _ = SCHEMES['dead_z'](met, static, state)
+    if Fg[0, 0] > 0 and np.array_equal(Fg, Fz):
+        R.ok("DEAD dead_g == dead_z for the same S", f"F={Fg[0, 0]:.4e} kg/m2/s")
+    else:
+        R.fail("DEAD dead_g == dead_z for the same S", f"{Fg[0, 0]:.4e} vs {Fz[0, 0]:.4e}")
+
+    # ------------------------------------------------------------------
+    # 8. Consistency of the assembled flux with the pieces (u* from the
+    #    log law, threshold, Q_s, alpha) at one hand-evaluated point.
+    # ------------------------------------------------------------------
+    met, static, lai = _make_dead_inputs(u10=10.0, v10=0.0, S=0.5, clay=5.0, f_erodible=0.8)
+    F, d = _run_dead(met, static, lai)
+    ustar_hand = 10.0 * 0.4 / np.log(10.0 / 1e-4)
+    rho_here = float(d['rhoa'][0, 0])
+    uft_hand = float(dead_ustar_ft0(np.array([[rho_here]]))[0, 0]) * float(d['f_moisture_dead'][0, 0])
+    Q_hand = float(dead_saltation(np.array([[rho_here]]), np.array([[ustar_hand]]),
+                                  np.array([[uft_hand]]))[0, 0])
+    F_hand = Q_hand * float(d['f_bare'][0, 0]) * D['T_default'] * 0.5 * a5
+    if (abs(d['ustar_10m'][0, 0] - ustar_hand) < 1e-12 and F[0, 0] > 0
+            and abs(F[0, 0] - F_hand) / F_hand < 1e-12):
+        R.ok("DEAD assembled flux = Q_s f_bare T S alpha",
+             f"u*={ustar_hand:.4f}, u*ft={uft_hand:.4f}, F={F[0, 0]:.4e} kg/m2/s")
+    else:
+        R.fail("DEAD assembled flux", f"F={F[0, 0]:.4e} vs hand {F_hand:.4e}")
+
+    # ------------------------------------------------------------------
+    # 9. Missing 10 m wind raises a clear error.
+    # ------------------------------------------------------------------
+    met, static, lai = _make_dead_inputs()
+    del met['u10']
+    try:
+        _run_dead(met, static, lai)
+        R.fail("DEAD error without 10 m wind", "no exception")
+    except ValueError as e:
+        R.ok("DEAD error without 10 m wind", str(e)[:60])
 
 
 def test_diagnostic_ranges(diag_file, R):
@@ -1185,6 +1356,7 @@ Examples:
     if args.unit_tests:
         test_physics(R)
         test_regrid(R)
+        test_dead(R)
 
     if args.diags:
         test_diagnostic_ranges(args.diags, R)
