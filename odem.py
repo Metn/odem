@@ -843,7 +843,7 @@ def compute_emission(met, static, lai, C_tune=0.05):
         'rhoa': rhoa, 'ustar_ft0': ustar_ft0, 'ustar_ft_wet': ustar_ft_wet,
         'ustar_it': ustar_it, 'wnd_frc_slt': wnd_frc_slt,
         'f_bare': f_bare, 'f_eff_r': f_eff_r, 'f_eff_v': f_eff_v,
-        'F_eff': F_eff, 'kappa': kappa, 'C_d': C_d, 'eta': eta,
+        'F_eff': F_eff, 'kappa': kappa, 'C_d': C_d, 'eta': eta, 'clay_scale': clay_scale,
         'D_p': D_p, 'f_moisture': f_moisture,
     }
     return F_d, diag
