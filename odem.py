@@ -300,6 +300,16 @@ class ConservativeRegridder:
         s_lon_e = _cell_edges(s_lon)
         t_lon_e = _cell_edges(t_lon)
         src_span = s_lon_e[-1] - s_lon_e[0]
+        # A global grid whose centres carry georeferencing round-off (the
+        # MODIS BRDF GeoTIFF: 1440 cells at 0.25000114 deg, span 360.0016)
+        # overshoots 360 by far less than a cell. Rescale its edges about
+        # their midpoint to span exactly 360; a real duplicated wrap column
+        # overshoots by a whole cell and still raises below.
+        overshoot = src_span - 360.0
+        if 1e-6 < overshoot <= 0.01 * float(np.median(np.diff(s_lon_e))):
+            mid = 0.5 * (s_lon_e[0] + s_lon_e[-1])
+            s_lon_e = mid + (s_lon_e - mid) * (360.0 / src_span)
+            src_span = s_lon_e[-1] - s_lon_e[0]
         if src_span > 360.0 + 1e-6:
             raise ValueError(f"Source longitude cells span {src_span:.6f} deg > 360; "
                              "a duplicated wrap column would be double counted")

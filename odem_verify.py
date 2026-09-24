@@ -579,6 +579,38 @@ def test_regrid(R):
         R.fail("Regrid longitude wrap (0..360 source == -180..180 source)",
                f"max |diff| = {maxdiff:.1e}")
 
+    # ------------------------------------------------------------------
+    # 7. Global source grid with georeferencing round-off in its spacing
+    #    (the MODIS BRDF file: 1440 cells at 0.25000114 deg, edge span
+    #    360.0016 deg) is accepted as global: constant field stays constant
+    #    and the area integral is conserved; a source with a duplicated wrap
+    #    column (one whole extra cell) is still refused.
+    # ------------------------------------------------------------------
+    d_brdf = 0.25000114
+    brdf_lon = -179.8758228 + d_brdf * np.arange(1440)
+    brdf_lat = np.linspace(89.875, -89.875, 720)
+    try:
+        rg = ConservativeRegridder(brdf_lon, brdf_lat, m2_lon, m2_lat)
+        yc = rg(np.full((720, 1440), 2.5))
+        x = 0.5 + rng.random((720, 1440))
+        y = rg(x)
+        rel = abs(area_integral(y, rg.tgt_area) - area_integral(x, rg.src_area)) / area_integral(x, rg.src_area)
+        maxdev = float(np.max(np.abs(yc - 2.5)))
+        ok7 = maxdev <= 1e-12 and rel <= 1e-12
+        msg7 = f"constant max dev {maxdev:.1e}, area-integral rel diff {rel:.1e}"
+    except ValueError as e:
+        ok7, msg7 = False, f"refused: {e}"
+    dup_lon = np.arange(-180.0, 180.0 + 0.125, 0.25)   # 1441 centres: -180 and +180 both present
+    try:
+        ConservativeRegridder(dup_lon, era5_lat, m2_lon, m2_lat)
+        ok7, msg7 = False, msg7 + "; duplicated wrap column NOT refused"
+    except ValueError:
+        msg7 += "; duplicated wrap column refused"
+    if ok7:
+        R.ok("Regrid global source with spacing round-off (MODIS BRDF grid)", msg7)
+    else:
+        R.fail("Regrid global source with spacing round-off (MODIS BRDF grid)", msg7)
+
 
 # ===========================================================================
 # Level 2: Diagnostic field range checks
