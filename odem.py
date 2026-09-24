@@ -1577,9 +1577,10 @@ def flux_dead(met, static, state, S=None, T=DEAD_CONST['T_default'], clay_pct=No
     for constants:
       * g = 9.80665 (Fortran GRV_SFC) rather than 9.81 (A2).
       * Fecan threshold: A9 gives w_t = 0.01 a (17 f_clay + 14 f_clay^2) with
-        a = 1/f_clay = 5 by default; the Fortran computes w_t = 0.17 + 0.14
-        f_clay, which is A9 with the leading f_clay divided out (a = 1/f_clay
-        exactly), so the two agree only when a is read that way.
+        a = 5 by default; the Fortran computes w_t = 0.17 + 0.14 f_clay, i.e.
+        A9 with a = 1/f_clay. The two agree only at f_clay = 0.20, which is
+        GEOS-Chem's uniform clay; with SoilGrids clay they diverge (f_clay
+        0.10: 0.184 vs 0.092 kg kg-1). The Fortran form is implemented.
       * The 10 m wind is floored at 1 m/s (BLM_MBL WND_MIN_MBL), not in A3.
       * alpha carries the factor 100 (cm-1 to m-1) that Leung et al. (2023,
         Eq. 10) and A2 omit in writing phi = 10^(13.4 f_clay - 6).
@@ -1604,8 +1605,8 @@ def flux_dead(met, static, state, S=None, T=DEAD_CONST['T_default'], clay_pct=No
       * Uniform clay: SOI_TXT_GET overrides the clay map with MSS_FRC_CLY_GLB
         = 0.20 everywhere ("fxm Temporarily"), so GEOS-Chem's alpha is 0.0479
         m-1 and w_t = 0.198 kg kg-1 in every cell. ODEM uses the SoilGrids clay
-        so the schemes share statics; pass clay_pct=20.0 to reproduce the
-        GEOS-Chem behaviour (used for the diagnosis runs, never by default).
+        so the schemes share statics; clay_pct=20.0 (--dead-clay-uniform 20)
+        reproduces the GEOS-Chem behaviour (validation row, never by default).
       * Bare fraction from LF_DRY, fractional snow, soil-temperature freeze
         cutoff (LND_FRC_MBL_GET): replaced by the shared f_bare and mask.
       * Bulk density from VWC_sat(sand) (VWC2GWC, HYD_PRP_GET): replaced by
@@ -1615,6 +1616,16 @@ def flux_dead(met, static, state, S=None, T=DEAD_CONST['T_default'], clay_pct=No
         of the bins is 0.9188 of the total vertical flux (lognormal overlap of
         the three d'Almeida modes with 0.2 to 12 um); ODEM returns the total.
       * CaCO3 masking (off in GEOS-Chem), the 350 K temperature cap.
+
+    Comparing with GEOS-Chem output: the HEMCO DEAD diagnostics and the Meng
+    et al. (2021) offline files carry the sum of the four transport bins,
+    0.9188 of the total vertical flux returned here; multiply F_d by 0.9188
+    before comparing totals.
+
+    S maps (--dead-s-map): '2x25' = GEOS-Chem DUST_DEAD v2019-06 GOC_SRC or
+    EF_GEO with T = 4.7586e-4 (createRunDir.sh, MERRA-2 2x2.5); '025' = Jun
+    Meng's 0.25 deg GOC_SRC (dead_g only) with T = 4.7376e-4 (Meng 2021
+    README). T is applied unchanged on every meteorology grid.
 
     Parameters
     ----------
