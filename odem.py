@@ -1063,7 +1063,10 @@ def surface_state(met, static, lai):
     }
 
 
-def flux_kok14(met, static, state, C_tune=0.05):
+HOLDABLE = ('f_eff_r', 'f_eff_v', 'f_moisture', 'C_d', 'kappa', 'eta')
+
+
+def flux_kok14(met, static, state, C_tune=0.05, hold=()):
     """
     Kok et al. (2014) emission flux, Leung et al. (2023) formulation, from a
     surface state (v2 split, 2026-09-24). Steps 12 to 16 of the v1.0
@@ -1071,12 +1074,24 @@ def flux_kok14(met, static, state, C_tune=0.05):
     clay scaling, turbulent intermittency eta (Comola et al., 2019) and the
     flux equation. Expressions unchanged from v1.0.
 
+    hold : sequence of factor names from HOLDABLE, each held at its neutral
+        value for a sensitivity ladder (v2, --hold): 'f_eff_r' and 'f_eff_v'
+        at 1 (no rock or vegetation drag partition, u*_s recomputed),
+        'f_moisture' at 1 (dry threshold, u*_st recomputed), 'C_d' at C_d0
+        (constant erodibility), 'kappa' at 0 (no fragmentation exponent),
+        'eta' at 1 (no intermittency). With hold=() the code path is the v1.0
+        path unchanged.
+
     Returns
     -------
     F_d : ndarray (lat, lon) — dust emission flux [kg/m²/s]
     diag : dict — diagnostic fields (same keys as v1.0, plus clay_scale)
     """
     C = CONST
+    hold = tuple(hold)
+    for h in hold:
+        if h not in HOLDABLE:
+            raise ValueError(f"cannot hold '{h}'; choose from {HOLDABLE}")
     mask = state['mask']
     rhoa = state['rhoa']
     D_p = state['D_p']
@@ -1093,11 +1108,25 @@ def flux_kok14(met, static, state, C_tune=0.05):
     f_bare = state['f_bare']
     ustar_st = state['ustar_st']
 
+    if 'f_eff_r' in hold or 'f_eff_v' in hold:
+        if 'f_eff_r' in hold:
+            f_eff_r = np.ones_like(f_eff_r)
+        if 'f_eff_v' in hold:
+            f_eff_v = np.ones_like(f_eff_v)
+        F_eff = f_eff_r * f_eff_v
+        wnd_frc_slt = met['zust'] * F_eff
+    if 'f_moisture' in hold:
+        f_moisture = np.ones_like(f_moisture)
+        ustar_ft_wet = ustar_ft0 * f_moisture
+        ustar_st = ustar_ft_wet * np.sqrt(rhoa / C['rho_a0'])
+
     # ------------------------------------------------------------------
     # 12. Soil erodibility coefficient C_d
     #     C_d = C_d0 × exp(-C_e × (u*_st - u*_st0) / u*_st0)
     # ------------------------------------------------------------------
     C_d = C['C_d0'] * np.exp(-C['C_e'] * (ustar_st - C['ustar_st0']) / C['ustar_st0'])
+    if 'C_d' in hold:
+        C_d = np.full_like(C_d, C['C_d0'])
 
     # ------------------------------------------------------------------
     # 13. Fragmentation exponent κ (capped at 3)
@@ -1105,6 +1134,8 @@ def flux_kok14(met, static, state, C_tune=0.05):
     # ------------------------------------------------------------------
     kappa = C['C_alpha'] * (ustar_st - C['ustar_st0']) / C['ustar_st0']
     kappa = np.clip(kappa, 0.0, C['kappa_cap'])
+    if 'kappa' in hold:
+        kappa = np.zeros_like(kappa)
 
     # ------------------------------------------------------------------
     # 14. Clay mass fraction for emission scaling
@@ -1150,6 +1181,8 @@ def flux_kok14(met, static, state, C_tune=0.05):
         # Intermittency: fraction of time with active saltation
         eta = p_above_ft + cross_rate * (p_above_it - p_above_ft)
         eta = np.clip(np.nan_to_num(eta, nan=0.0), 0.0, 1.0)
+    if 'eta' in hold:
+        eta = np.ones_like(rhoa)
 
     # ------------------------------------------------------------------
     # 16. Dust emission flux — Kok et al. (2014) Eq. (1)
@@ -1530,7 +1563,8 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
 def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
               landcover_file=None, output_dir='output_v2', C_tune=0.05,
               save_diags=False, meteo_source='era5', scheme='k14',
-              max_steps=None, brdf_file=None, regrid_method='nearest'):
+              max_steps=None, brdf_file=None, regrid_method='nearest',
+              hold=()):
     """Run ODEM — Offline Dust Emission Model.
 
     meteo_path:      ERA5 or MERRA-2 file/directory.
@@ -1540,6 +1574,8 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     max_steps:       if set, stop after this many timesteps (development and
                      regression runs only; the outputs then cover a partial month).
     brdf_file:       monthly MODIS BRDF NetCDF, required by scheme 'aem'.
+    hold:            factors of the k14 scheme held at their neutral value
+                     (sensitivity ladder; see flux_kok14 and HOLDABLE).
     regrid_method:   'nearest' (default) or 'conservative' for the static inputs
                      (Prigent z0a, SoilGrids, MODIS land cover, MODIS LAI, BRDF).
     """
@@ -1547,8 +1583,11 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
         raise ValueError(f"unknown scheme '{scheme}'; choose from {sorted(SCHEMES)}")
     if scheme == 'aem' and not brdf_file:
         raise ValueError("--scheme aem needs --modis-brdf <modis_brdf_YYYY.nc>")
+    hold = tuple(h for h in hold if h)
+    if hold and scheme != 'k14':
+        raise ValueError("--hold applies to the k14 scheme only")
     RUN_SCHEME['key'] = scheme
-    RUN_SCHEME['label'] = SCHEME_LABEL[scheme]
+    RUN_SCHEME['label'] = SCHEME_LABEL[scheme] + (f" [held: {','.join(hold)}]" if hold else '')
     t0 = time.time()
 
     log.info("=" * 60)
@@ -1563,6 +1602,8 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     log.info(f"  Scheme:     {scheme} ({SCHEME_LABEL.get(scheme, scheme)})")
     if brdf_file:
         log.info(f"  MODIS BRDF: {brdf_file}")
+    if hold:
+        log.info(f"  Hold:       {', '.join(hold)} at neutral values")
     log.info(f"  Regrid:     {regrid_method} (static inputs onto the meteo grid)")
     log.info("=" * 60)
 
@@ -1600,7 +1641,7 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     # Diagnostic accumulators (only allocated if save_diags=True); the key set
     # is whatever the scheme returns, taken from the first timestep.
     diag_sums = {}
-    scheme_kwargs = {'C_tune': C_tune} if scheme == 'k14' else {}
+    scheme_kwargs = {'C_tune': C_tune, 'hold': hold} if scheme == 'k14' else {}
     flux_fn = SCHEMES[scheme]
     step_inputs = SCHEME_STEP_INPUTS.get(scheme, lambda inputs_, t_: {})
     n_steps = inputs.nt if max_steps is None else min(inputs.nt, int(max_steps))
@@ -1765,6 +1806,9 @@ Examples:
                    help='Emission scheme (default k14 = Kok 2014 / Leung 2023, the v1.0 physics)')
     p.add_argument('--max-steps', type=int, default=None,
                    help='Development only: stop after N timesteps (partial-month output)')
+    p.add_argument('--hold', default='',
+                   help='k14 sensitivity ladder: comma-separated factors held at their '
+                        f'neutral value, from {",".join(HOLDABLE)}')
     p.add_argument('--modis-brdf', default=None,
                    help='Monthly MODIS BRDF omega_n NetCDF (scripts/brdf_tif_to_nc.py); '
                         'required for --scheme aem')
@@ -1791,6 +1835,7 @@ Examples:
         max_steps=args.max_steps,
         brdf_file=args.modis_brdf,
         regrid_method=args.regrid,
+        hold=tuple(h.strip() for h in args.hold.split(',') if h.strip()),
     )
 
 
