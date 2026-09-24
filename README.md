@@ -44,6 +44,31 @@ python odem.py \
     --output-dir output_2006
 ```
 
+### Regridding of static inputs
+
+Prigent z0a (0.25 deg), SoilGrids and MODIS land cover (0.05 deg) and MODIS LAI
+are put on the meteorology grid by nearest neighbour by default. Add
+`--regrid conservative` for a first-order conservative (area-weighted) regrid:
+1-D overlap weights in sin(latitude) and longitude (periodic), tensor product,
+normalised over valid source cells only, so a cell with any valid source gets
+the area mean of its valid part. The default output is unchanged.
+
+### Resolution experiment: ERA5 on the MERRA-2 grid
+
+`regrid_met_conservative.py` regrids every variable of an ERA5 monthly file onto
+the MERRA-2 lat/lon grid with the same conservative method and writes a file with
+the ERA5 variable and dimension names, so `odem.py --era5` reads it unchanged:
+
+```bash
+python regrid_met_conservative.py \
+    --src era5_data/era5_dust_200601.nc \
+    --target-grid merra2_data/merra2_dust_200601.nc \
+    --out era5_on_merra2grid/era5_dust_200601.nc
+```
+
+`lsm` becomes a land fraction (thresholded at 0.5 by the model as before); the
+global attributes record the method, source, target grid and date.
+
 ## Input data
 
 All input datasets are freely available from their original providers:
@@ -64,7 +89,8 @@ See the user manual for detailed variable lists and file naming conventions.
 ```
 odem.py                  # Main model
 odem_analysis.py         # Post-processing (summary, comparison, seasonal)
-odem_verify.py           # Physics verification suite (38 tests)
+odem_verify.py           # Physics verification suite (38 tests) + conservative-regrid unit tests
+regrid_met_conservative.py  # ERA5 -> MERRA-2 grid conservative regrid (resolution experiment)
 requirements.txt
 scripts/
   scale_ctune.py          # Scale output to different C_tune values

@@ -13,6 +13,7 @@ Goal: correct results for correct reasons.
 
 Verification levels:
   1. Physics unit tests   — formulas tested at known inputs against analytical values
+     (plus conservative-regrid tests: identity, conservation, constant, block mean, missing)
   2. Diagnostic ranges    — intermediate fields within physically defensible bounds
   3. Spatial sanity       — emission patterns match known climatology constraints
   4. Global/regional budget — comparison against published observational estimates
@@ -50,7 +51,8 @@ import matplotlib.gridspec as gridspec
 # Import ODEM physics functions for unit testing
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
-from odem import air_density, median_particle_diameter, compute_emission, CONST
+from odem import (air_density, median_particle_diameter, compute_emission, CONST,
+                  ConservativeRegridder)
 
 
 # ===========================================================================
@@ -413,6 +415,167 @@ def test_physics(R):
     # Already enforced by np.clip — but test explicitly
     if F_d_sup[0, 0] >= 0 and F_d_sub[0, 0] >= 0:
         R.ok("No negative emission (F_d ≥ 0)")
+
+
+# ===========================================================================
+# Level 1b: Conservative regrid unit tests
+# ===========================================================================
+
+def test_regrid(R):
+    """Test the conservative (area-weighted) regridder on synthetic fields."""
+    print("\n[Level 1b] Conservative Regrid Unit Tests")
+    print("-" * 50)
+    rng = np.random.default_rng(20260924)
+
+    # Real grids used by the model
+    era5_lat = np.linspace(90.0, -90.0, 721)          # N to S, pole rows half cells
+    era5_lon = np.arange(-180.0, 180.0, 0.25)
+    m2_lat = np.linspace(-90.0, 90.0, 361)            # S to N
+    m2_lon = np.arange(-180.0, 180.0, 0.625)
+    lc_lat = np.round(np.linspace(89.975, -89.975, 3600), 6)   # MODIS 0.05 deg, N to S
+    lc_lon = np.round(np.linspace(-179.975, 179.975, 7200), 6)
+
+    def area_integral(field, area):
+        return float(np.sum(field * area))
+
+    # ------------------------------------------------------------------
+    # 1. Identity: same grid in, same field out
+    # ------------------------------------------------------------------
+    x = rng.random((721, 1440))
+    rg = ConservativeRegridder(era5_lon, era5_lat, era5_lon, era5_lat)
+    y = rg(x)
+    maxdiff = float(np.max(np.abs(y - x)))
+    bitwise = np.array_equal(x, y)
+    if maxdiff <= 1e-12:
+        R.ok("Regrid identity (0.25 deg -> same grid)",
+             f"max |diff| = {maxdiff:.1e}, bitwise = {bitwise}")
+    else:
+        R.fail("Regrid identity (0.25 deg -> same grid)", f"max |diff| = {maxdiff:.1e}")
+
+    # ------------------------------------------------------------------
+    # 2. Conservation of the global area integral, positive random field
+    # ------------------------------------------------------------------
+    for label, s_lon, s_lat, t_lon, t_lat in [
+            ("0.25 deg -> MERRA-2 grid", era5_lon, era5_lat, m2_lon, m2_lat),
+            ("0.05 deg -> 0.25 deg", lc_lon, lc_lat, era5_lon, era5_lat)]:
+        rg = ConservativeRegridder(s_lon, s_lat, t_lon, t_lat)
+        x = 0.5 + rng.random((s_lat.size, s_lon.size))
+        y = rg(x)
+        src_int = area_integral(x, rg.src_area)
+        tgt_int = area_integral(y, rg.tgt_area)
+        rel = abs(tgt_int - src_int) / abs(src_int)
+        if rel <= 1e-12 and np.all(np.isfinite(y)):
+            R.ok(f"Regrid conservation ({label})",
+                 f"relative difference of area integrals = {rel:.1e}")
+        else:
+            R.fail(f"Regrid conservation ({label})",
+                   f"relative difference = {rel:.1e}, finite = {np.all(np.isfinite(y))}")
+
+    # ------------------------------------------------------------------
+    # 3. Constant field stays constant (weights sum to one)
+    # ------------------------------------------------------------------
+    rg = ConservativeRegridder(era5_lon, era5_lat, m2_lon, m2_lat)
+    c = 3.7
+    y = rg(np.full((721, 1440), c))
+    maxdev = float(np.max(np.abs(y - c)))
+    if maxdev <= 1e-12:
+        R.ok("Regrid constant field (0.25 deg -> MERRA-2 grid)",
+             f"max |y - {c}| = {maxdev:.1e}")
+    else:
+        R.fail("Regrid constant field (0.25 deg -> MERRA-2 grid)",
+               f"max |y - {c}| = {maxdev:.1e}")
+
+    # ------------------------------------------------------------------
+    # 4. Analytical: integer-ratio coarsening in latitude only, same lon.
+    #    Source 0.25 deg centred at +-0.125 (edges on multiples of 0.25),
+    #    target 0.5 deg centred at +-0.25 (edges on multiples of 0.5), so each
+    #    target row is exactly two source rows; the expected value is the
+    #    sin(lat)-weighted mean of the two, computed here independently.
+    # ------------------------------------------------------------------
+    s_lat = np.arange(-89.875, 90.0, 0.25)   # 720 rows, S to N
+    t_lat = np.arange(-89.75, 90.0, 0.5)     # 360 rows
+    lon = np.arange(-180.0, 180.0, 1.0)
+    x = rng.random((720, 360))
+    rg = ConservativeRegridder(lon, s_lat, lon, t_lat)
+    y = rg(x)
+    s_edges = np.arange(-90.0, 90.0 + 1e-9, 0.25)
+    w = np.sin(np.deg2rad(s_edges[1:])) - np.sin(np.deg2rad(s_edges[:-1]))
+    expected = ((x[0::2] * w[0::2, None] + x[1::2] * w[1::2, None])
+                / (w[0::2] + w[1::2])[:, None])
+    maxdiff = float(np.max(np.abs(y - expected)))
+    if y.shape == expected.shape and maxdiff <= 1e-12:
+        R.ok("Regrid analytical block mean (0.25 -> 0.5 deg lat)",
+             f"max |diff| vs independent sin-weighted mean = {maxdiff:.1e}")
+    else:
+        R.fail("Regrid analytical block mean (0.25 -> 0.5 deg lat)",
+               f"shape {y.shape} vs {expected.shape}, max |diff| = {maxdiff:.1e}")
+
+    # ------------------------------------------------------------------
+    # 5. Missing values: NaN (and < -900) are excluded from the mean; a
+    #    target cell with no valid source gets `fill`. Same grids as test 4
+    #    plus 2:1 in longitude so each target cell is a 2x2 source block.
+    # ------------------------------------------------------------------
+    s_lon = np.arange(-179.5, 180.0, 1.0)    # 360 cols, edges on integers
+    t_lon = np.arange(-179.0, 180.0, 2.0)    # 180 cols, edges on even integers
+    x = 1.0 + rng.random((720, 360))
+    # Block A: one of four source cells missing (NaN), target row 100, col 50
+    x[200, 100] = np.nan
+    # Block B: one of four missing as a -999 sentinel, target row 120, col 60
+    x[241, 121] = -999.0
+    # Block C: all four missing, target row 150, col 70
+    x[300:302, 140:142] = np.nan
+    rg = ConservativeRegridder(s_lon, s_lat, t_lon, t_lat)
+    ok = True
+    details = []
+    for fill in (np.nan, 0.0):
+        y = rg(x, fill=fill)
+        # A: expected mean of the three valid cells with sin weights
+        wa = w[200:202]
+        vals = np.array([[np.nan, x[200, 101]], [x[201, 100], x[201, 101]]])
+        ww = np.array([[wa[0], wa[0]], [wa[1], wa[1]]])
+        m = np.isfinite(vals)
+        exp_a = np.sum(vals[m] * ww[m]) / np.sum(ww[m])
+        da = abs(y[100, 50] - exp_a)
+        # B: sentinel treated as missing
+        wb = w[240:242]
+        vals = np.array([[x[240, 120], x[240, 121]], [x[241, 120], np.nan]])
+        ww = np.array([[wb[0], wb[0]], [wb[1], wb[1]]])
+        m = np.isfinite(vals)
+        exp_b = np.sum(vals[m] * ww[m]) / np.sum(ww[m])
+        db = abs(y[120, 60] - exp_b)
+        # C: nothing valid -> fill
+        got_c = y[150, 70]
+        c_ok = np.isnan(got_c) if np.isnan(fill) else (got_c == fill)
+        # Neighbours unaffected: the cell below block C is fully valid
+        nb_ok = np.isfinite(y[149, 70]) and y[149, 70] >= 1.0
+        n_fill = int(np.isnan(y).sum()) if np.isnan(fill) else int((y == fill).sum())
+        this_ok = (da <= 1e-12) and (db <= 1e-12) and c_ok and nb_ok and n_fill == 1
+        ok = ok and this_ok
+        details.append(f"fill={fill}: |dA|={da:.1e}, |dB|={db:.1e}, "
+                       f"C={'fill' if c_ok else got_c}, n_fill={n_fill}")
+    if ok:
+        R.ok("Regrid missing values (partial -> valid mean, empty -> fill)",
+             "; ".join(details))
+    else:
+        R.fail("Regrid missing values (partial -> valid mean, empty -> fill)",
+               "; ".join(details))
+
+    # ------------------------------------------------------------------
+    # 6. Longitude convention: a 0..360 source gives the same result as the
+    #    equivalent -180..180 source (periodic wrap handled).
+    # ------------------------------------------------------------------
+    x = rng.random((721, 1440))
+    y_a = ConservativeRegridder(era5_lon, era5_lat, m2_lon, m2_lat)(x)
+    lon360 = np.arange(0.0, 360.0, 0.25)
+    x360 = np.roll(x, -720, axis=1)   # column 0 of x is lon -180 -> becomes lon 180
+    y_b = ConservativeRegridder(lon360, era5_lat, m2_lon, m2_lat)(x360)
+    maxdiff = float(np.max(np.abs(y_a - y_b)))
+    if maxdiff <= 1e-12:
+        R.ok("Regrid longitude wrap (0..360 source == -180..180 source)",
+             f"max |diff| = {maxdiff:.1e}")
+    else:
+        R.fail("Regrid longitude wrap (0..360 source == -180..180 source)",
+               f"max |diff| = {maxdiff:.1e}")
 
 
 # ===========================================================================
@@ -1021,6 +1184,7 @@ Examples:
 
     if args.unit_tests:
         test_physics(R)
+        test_regrid(R)
 
     if args.diags:
         test_diagnostic_ranges(args.diags, R)

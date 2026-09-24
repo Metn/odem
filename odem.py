@@ -162,6 +162,222 @@ def median_particle_diameter(clay_frac, silt_frac, lai):
 
 
 # ===========================================================================
+# Conservative (area-weighted) regridding
+# ===========================================================================
+
+REGRID_METHODS = ('nearest', 'conservative')
+
+
+def _cell_edges(centres, clip=None):
+    """Cell edges of a monotonically increasing 1-D cell-centre axis.
+
+    Interior edges are midpoints between neighbouring centres; the two outer
+    edges extrapolate half the end spacing. With clip=(lo, hi) the edges are
+    clipped, which turns the ERA5 / MERRA-2 pole rows (centres at +-90) into
+    half cells, as they are on the sphere.
+    """
+    c = np.asarray(centres, dtype=np.float64)
+    if c.size < 2:
+        raise ValueError("Need at least two cell centres to build cell edges")
+    edges = np.empty(c.size + 1, dtype=np.float64)
+    edges[1:-1] = 0.5 * (c[:-1] + c[1:])
+    edges[0] = c[0] - 0.5 * (c[1] - c[0])
+    edges[-1] = c[-1] + 0.5 * (c[-1] - c[-2])
+    if clip is not None:
+        edges = np.clip(edges, clip[0], clip[1])
+    return edges
+
+
+def _interval_overlap(src_edges, tgt_edges, shift=0.0, measure=None):
+    """Sparse (n_tgt, n_src) matrix of overlap between two sets of 1-D cells.
+
+    Both edge arrays must be monotonically increasing. `shift` is added to the
+    source edges (used for periodic longitude copies). `measure` maps an edge
+    coordinate to the measure in which overlaps are counted (sin(lat) for
+    latitude so that the overlap is proportional to true spherical area);
+    None means plain length. Returns a scipy.sparse.csr_matrix.
+    """
+    from scipy import sparse
+
+    s = np.asarray(src_edges, dtype=np.float64) + shift
+    t = np.asarray(tgt_edges, dtype=np.float64)
+    ns, nt = s.size - 1, t.size - 1
+    # Candidate source cells for each target cell: those whose upper edge is
+    # above the target lower edge and whose lower edge is below the target
+    # upper edge. searchsorted gives the index ranges without a Python loop
+    # over cells.
+    first = np.searchsorted(s[1:], t[:-1], side='right')   # first src with hi > tgt lo
+    last = np.searchsorted(s[:-1], t[1:], side='left')     # one past last src with lo < tgt hi
+    first = np.minimum(first, ns)
+    last = np.clip(last, first, ns)
+    counts = last - first
+    if counts.sum() == 0:
+        return sparse.csr_matrix((nt, ns), dtype=np.float64)
+    rows = np.repeat(np.arange(nt), counts)
+    cols = np.concatenate([np.arange(a, b) for a, b in zip(first, last) if b > a])
+    lo = np.maximum(s[cols], t[rows])
+    hi = np.minimum(s[cols + 1], t[rows + 1])
+    if measure is None:
+        w = hi - lo
+    else:
+        w = measure(hi) - measure(lo)
+    # Discard slivers from floating-point edge noise (e.g. 0.05 deg edges vs
+    # 0.25 deg edges that should coincide but differ in the last bit).
+    tol = 1e-9 * min(np.min(np.diff(s)), np.min(np.diff(t)))
+    keep = (hi - lo) > tol
+    M = sparse.csr_matrix((w[keep], (rows[keep], cols[keep])), shape=(nt, ns),
+                          dtype=np.float64)
+    M.sum_duplicates()
+    return M
+
+
+def _sin_deg(x):
+    return np.sin(np.deg2rad(x))
+
+
+class ConservativeRegridder:
+    """First-order conservative (area-weighted) regridding between two
+    regular lat/lon cell-centre grids.
+
+    The overlap weights are separable: W[(i,j),(k,l)] = A_lat[i,k] * A_lon[j,l]
+    where A_lat holds sin(lat) overlaps (true spherical area) and A_lon plain
+    longitude overlaps with periodic wrap. The 2-D weight matrix is never
+    formed; the operator is applied as A_lat @ (X @ A_lon.T), which is exact
+    and keeps memory small even for a 0.05 deg source (3600 x 7200).
+
+    Weights are normalised by the target-cell extent so that a source grid
+    that fully covers a target cell gives row sums of exactly one. Missing
+    source values (NaN or < -900) are excluded and the result is normalised
+    over the VALID overlap only: a target cell with any valid source gets the
+    area mean of its valid part, a target cell with none gets `fill`.
+
+    Fine-to-coarse: area mean of the source cells inside each target cell.
+    Coarse-to-fine: piecewise constant (each target cell takes the area mean
+    of the source cells it overlaps, i.e. the one it sits in).
+
+    Source latitude may run N to S or S to N; source longitude may be in
+    -180..180 or 0..360. The target grid is given by 1-D centre arrays in
+    whatever order the meteorology file uses; the output follows that order.
+    """
+
+    def __init__(self, src_lon, src_lat, tgt_lon, tgt_lat):
+        from scipy import sparse
+
+        src_lon = np.asarray(src_lon, dtype=np.float64)
+        src_lat = np.asarray(src_lat, dtype=np.float64)
+        tgt_lon = np.asarray(tgt_lon, dtype=np.float64)
+        tgt_lat = np.asarray(tgt_lat, dtype=np.float64)
+
+        # Work on increasing axes; remember which axes must be flipped.
+        self.flip_src_lat = bool(src_lat[0] > src_lat[-1])
+        self.flip_src_lon = bool(src_lon[0] > src_lon[-1])
+        self.flip_tgt_lat = bool(tgt_lat[0] > tgt_lat[-1])
+        self.flip_tgt_lon = bool(tgt_lon[0] > tgt_lon[-1])
+        s_lat = src_lat[::-1] if self.flip_src_lat else src_lat
+        s_lon = src_lon[::-1] if self.flip_src_lon else src_lon
+        t_lat = tgt_lat[::-1] if self.flip_tgt_lat else tgt_lat
+        t_lon = tgt_lon[::-1] if self.flip_tgt_lon else tgt_lon
+        for name, ax in (('src_lat', s_lat), ('src_lon', s_lon),
+                         ('tgt_lat', t_lat), ('tgt_lon', t_lon)):
+            if np.any(np.diff(ax) <= 0):
+                raise ValueError(f"{name} is not strictly monotonic")
+
+        self.src_shape = (src_lat.size, src_lon.size)
+        self.tgt_shape = (tgt_lat.size, tgt_lon.size)
+
+        # Latitude: overlaps measured in sin(lat), i.e. spherical area.
+        s_lat_e = _cell_edges(s_lat, clip=(-90.0, 90.0))
+        t_lat_e = _cell_edges(t_lat, clip=(-90.0, 90.0))
+        A_lat = _interval_overlap(s_lat_e, t_lat_e, measure=_sin_deg)
+        tgt_lat_ext = _sin_deg(t_lat_e[1:]) - _sin_deg(t_lat_e[:-1])
+
+        # Longitude: plain angular overlap with periodic copies of the source.
+        s_lon_e = _cell_edges(s_lon)
+        t_lon_e = _cell_edges(t_lon)
+        src_span = s_lon_e[-1] - s_lon_e[0]
+        if src_span > 360.0 + 1e-6:
+            raise ValueError(f"Source longitude cells span {src_span:.6f} deg > 360; "
+                             "a duplicated wrap column would be double counted")
+        A_lon = None
+        for k in (-2, -1, 0, 1, 2):
+            M = _interval_overlap(s_lon_e, t_lon_e, shift=360.0 * k)
+            A_lon = M if A_lon is None else A_lon + M
+        tgt_lon_ext = t_lon_e[1:] - t_lon_e[:-1]
+
+        # Normalise by target-cell extent (row sums == 1 where fully covered).
+        self.A_lat = (sparse.diags(1.0 / tgt_lat_ext) @ A_lat).tocsr()
+        self.A_lon = (sparse.diags(1.0 / tgt_lon_ext) @ A_lon).tocsr()
+        self.A_lonT = self.A_lon.T.tocsr()
+
+        # Cell areas (steradian) for diagnostics and conservation checks,
+        # in the caller's axis order.
+        src_lat_ext = _sin_deg(s_lat_e[1:]) - _sin_deg(s_lat_e[:-1])
+        src_lon_ext = s_lon_e[1:] - s_lon_e[:-1]
+        self.tgt_area = np.outer(tgt_lat_ext, np.deg2rad(tgt_lon_ext))
+        self.src_area = np.outer(src_lat_ext, np.deg2rad(src_lon_ext))
+        if self.flip_tgt_lat:
+            self.tgt_area = self.tgt_area[::-1, :]
+        if self.flip_tgt_lon:
+            self.tgt_area = self.tgt_area[:, ::-1]
+        if self.flip_src_lat:
+            self.src_area = self.src_area[::-1, :]
+        if self.flip_src_lon:
+            self.src_area = self.src_area[:, ::-1]
+        self.tgt_area = np.ascontiguousarray(self.tgt_area)
+        self.src_area = np.ascontiguousarray(self.src_area)
+
+        # Denominator for the all-valid case, computed once.
+        self._den_all_valid = self._apply_raw(np.ones(self.src_shape))
+
+    def _apply_raw(self, X):
+        """A_lat @ X @ A_lon.T for X of shape (..., n_src_lat, n_src_lon)."""
+        lead = X.shape[:-2]
+        nsl, nslon = self.src_shape
+        ntl, ntlon = self.tgt_shape
+        X2 = X.reshape(-1, nslon)                        # (T*nsl, nslon)
+        Y = X2 @ self.A_lonT                             # dense (T*nsl, ntlon)
+        Y = np.asarray(Y).reshape(-1, nsl, ntlon)        # (T, nsl, ntlon)
+        Y = np.ascontiguousarray(Y.transpose(1, 0, 2)).reshape(nsl, -1)
+        Z = self.A_lat @ Y                               # (ntl, T*ntlon)
+        Z = np.asarray(Z).reshape(ntl, -1, ntlon).transpose(1, 0, 2)
+        return Z.reshape(lead + (ntl, ntlon))
+
+    def __call__(self, data, fill=np.nan):
+        """Regrid `data` of shape (..., n_src_lat, n_src_lon). Returns float64
+        of shape (..., n_tgt_lat, n_tgt_lon) in the target axis order."""
+        X = np.array(data, dtype=np.float64)   # copy; never modify the caller's array
+        if X.shape[-2:] != self.src_shape:
+            raise ValueError(f"data shape {X.shape[-2:]} does not match source grid "
+                             f"{self.src_shape}")
+        if self.flip_src_lat:
+            X = X[..., ::-1, :]
+        if self.flip_src_lon:
+            X = X[..., :, ::-1]
+        valid = np.isfinite(X) & (X >= -900.0)
+        all_valid = bool(valid.all())
+        if not all_valid:
+            X = np.where(valid, X, 0.0)
+        num = self._apply_raw(X)
+        if all_valid:
+            den = np.broadcast_to(self._den_all_valid, num.shape)
+        else:
+            den = self._apply_raw(valid.astype(np.float64))
+        covered = den > 0.0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            out = np.where(covered, num / np.where(covered, den, 1.0), fill)
+        if self.flip_tgt_lat:
+            out = out[..., ::-1, :]
+        if self.flip_tgt_lon:
+            out = out[..., :, ::-1]
+        return np.ascontiguousarray(out)
+
+
+def conservative_regrid(src_lon, src_lat, data, tgt_lon, tgt_lat, fill=np.nan):
+    """One-off conservative regrid; see ConservativeRegridder for the rules."""
+    return ConservativeRegridder(src_lon, src_lat, tgt_lon, tgt_lat)(data, fill=fill)
+
+
+# ===========================================================================
 # Input data loader
 # ===========================================================================
 
@@ -170,11 +386,19 @@ class InputData:
     MODIS land cover, and SoilGrids data."""
 
     def __init__(self, meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
-                 landcover_file=None, meteo_source='era5', brdf_file=None):
+                 landcover_file=None, meteo_source='era5', brdf_file=None,
+                 regrid_method='nearest'):
         """meteo_path: ERA5 or MERRA-2 file/directory. meteo_source: 'era5' or 'merra2'.
         brdf_file: NetCDF of monthly MODIS BRDF omega_n (scripts/brdf_tif_to_nc.py),
-        needed by the albedo-based scheme only."""
+        needed by the albedo-based scheme only.
+        regrid_method: 'nearest' (default, nearest neighbour) or 'conservative'
+        (area-weighted) for the static inputs regridded onto the meteorology grid."""
         self.meteo_source = meteo_source
+        if regrid_method not in REGRID_METHODS:
+            raise ValueError(f"Unknown regrid_method: {regrid_method!r} "
+                             f"(use one of {REGRID_METHODS})")
+        self.regrid_method = regrid_method
+        self._regridders = {}  # {(src_lat bytes, src_lon bytes): ConservativeRegridder}
         self.era5_path = self.meteo_path = Path(meteo_path)
         self.soilgrids_dir = Path(soilgrids_dir)
         self.prigent_file = prigent_file
@@ -513,6 +737,29 @@ class InputData:
         return self._regrid(src_lon, src_lat, data, fill=np.nan)
 
     def _regrid(self, src_lon, src_lat, data, fill=0.0):
+        """Regrid a (lat, lon) source field onto the meteorology grid.
+
+        Dispatches on self.regrid_method: 'nearest' is the original nearest
+        neighbour path (unchanged), 'conservative' the area-weighted overlap
+        method (ConservativeRegridder), with weights cached per source grid.
+        Both treat NaN and values < -900 as missing.
+        """
+        if self.regrid_method == 'conservative':
+            return self._regrid_conservative(src_lon, src_lat, data, fill=fill)
+        return self._regrid_nearest(src_lon, src_lat, data, fill=fill)
+
+    def _regrid_conservative(self, src_lon, src_lat, data, fill=0.0):
+        """Area-weighted regrid; weight matrices cached per source grid."""
+        src_lon = np.asarray(src_lon, dtype=np.float64)
+        src_lat = np.asarray(src_lat, dtype=np.float64)
+        key = (src_lat.tobytes(), src_lon.tobytes())
+        rg = self._regridders.get(key)
+        if rg is None:
+            rg = ConservativeRegridder(src_lon, src_lat, self.lon, self.lat)
+            self._regridders[key] = rg
+        return rg(data, fill=fill)
+
+    def _regrid_nearest(self, src_lon, src_lat, data, fill=0.0):
         """Nearest-neighbor regrid to ERA5 grid."""
         from scipy.interpolate import RegularGridInterpolator
 
@@ -1283,7 +1530,7 @@ def _write_diag_mean(filepath, lon, lat, diag_sums, static, nt, t_start, t_end):
 def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
               landcover_file=None, output_dir='output_v2', C_tune=0.05,
               save_diags=False, meteo_source='era5', scheme='k14',
-              max_steps=None, brdf_file=None):
+              max_steps=None, brdf_file=None, regrid_method='nearest'):
     """Run ODEM — Offline Dust Emission Model.
 
     meteo_path:      ERA5 or MERRA-2 file/directory.
@@ -1292,6 +1539,9 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     scheme:          emission scheme key in SCHEMES ('k14' = v1.0 physics).
     max_steps:       if set, stop after this many timesteps (development and
                      regression runs only; the outputs then cover a partial month).
+    brdf_file:       monthly MODIS BRDF NetCDF, required by scheme 'aem'.
+    regrid_method:   'nearest' (default) or 'conservative' for the static inputs
+                     (Prigent z0a, SoilGrids, MODIS land cover, MODIS LAI, BRDF).
     """
     if scheme not in SCHEMES:
         raise ValueError(f"unknown scheme '{scheme}'; choose from {sorted(SCHEMES)}")
@@ -1313,12 +1563,13 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     log.info(f"  Scheme:     {scheme} ({SCHEME_LABEL.get(scheme, scheme)})")
     if brdf_file:
         log.info(f"  MODIS BRDF: {brdf_file}")
+    log.info(f"  Regrid:     {regrid_method} (static inputs onto the meteo grid)")
     log.info("=" * 60)
 
     # Load inputs
     inputs = InputData(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
                        landcover_file=landcover_file, meteo_source=meteo_source,
-                       brdf_file=brdf_file)
+                       brdf_file=brdf_file, regrid_method=regrid_method)
     inputs.load()
 
     # Precompute static fields
@@ -1505,6 +1756,10 @@ Examples:
     p.add_argument('--save-diags', action='store_true',
                    help='Save time-mean diagnostic fields to odem_diag_mean.nc '
                         '(recommended for verification runs)')
+    p.add_argument('--regrid', choices=REGRID_METHODS, default='nearest',
+                   help='How static inputs (Prigent z0a, SoilGrids, MODIS land cover, '
+                        'MODIS LAI) are put on the meteo grid: nearest neighbour '
+                        '(default) or conservative area-weighted')
 
     p.add_argument('--scheme', default='k14', choices=sorted(SCHEMES),
                    help='Emission scheme (default k14 = Kok 2014 / Leung 2023, the v1.0 physics)')
@@ -1535,6 +1790,7 @@ Examples:
         scheme=args.scheme,
         max_steps=args.max_steps,
         brdf_file=args.modis_brdf,
+        regrid_method=args.regrid,
     )
 
 
