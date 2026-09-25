@@ -40,8 +40,7 @@ FIG_DIR = Path(os.environ.get("ODEM_FIG_DIR", "./figures"))
 _data_env = os.environ.get("ODEM_DATA")
 if not _data_env:
     raise FileNotFoundError(
-        "Set ODEM_DATA environment variable to your data directory, e.g.:
-"
+        "Set ODEM_DATA environment variable to your data directory, e.g.:\n"
         "  export ODEM_DATA=/path/to/dust_model_data"
     )
 DATA_ROOT = Path(_data_env)
