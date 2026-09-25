@@ -30,6 +30,8 @@ from calendar import monthrange
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gmd_style import apply_gmd_style
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from budget_table import KOK2021  # noqa: E402
 
 # ── Paths ─────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -181,9 +183,9 @@ def make_figure():
     fig, ax = plt.subplots(figsize=(7.2, 3.4))
 
     # Kok (2021) PM20 band — fill_between on x=0..11 so it stays within data range
-    kok_mean_monthly = 5000 / 12
-    kok_lo_monthly = 3400 / 12
-    kok_hi_monthly = 6600 / 12
+    kok_mean_monthly = KOK2021["Global"][0] / 12   # Kok et al. (2021) Table 1: 4700 (3400 to 9100)
+    kok_lo_monthly = KOK2021["Global"][1] / 12
+    kok_hi_monthly = KOK2021["Global"][2] / 12
     ax.fill_between(x, kok_lo_monthly, kok_hi_monthly,
                     color="#4dac26", alpha=0.12, zorder=1,
                     label="Kok et al. (2021) range")

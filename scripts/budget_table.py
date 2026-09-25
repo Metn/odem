@@ -4,9 +4,15 @@
 Reads each run's odem_annual_mean.nc (F_d_mean, kg m-2 s-1) and, when present,
 the monthly odem_YYYYMM.nc files for the seasonal cycle. Prints a Markdown
 table and writes a CSV: global total (Tg/yr), ratio to the Kok et al. (2021)
-PM20 constraint (5000 Tg/yr, 3400 to 6600), the seven paper regions of
-Sect. 4.3 with their Kok et al. (2021) Table 1 PM20 values, and the monthly
-totals. The cell-area formula is the one odem.py and odem_regression.py use.
+PM20 constraint, the seven paper regions of Sect. 4.3 with their ratio to the
+matching Kok et al. (2021) region, and the monthly totals.
+
+Annual-total convention (the one of v1, odem.py and odem_regression.py):
+the time mean of the flux over every output step, times the spherical cell
+area R^2 cos(lat) dlat dlon (R = 6.371e6 m), times 365.25 days. Monthly
+totals use the same cell area and the seconds covered by the month's steps.
+Every script that reports a total imports annual_total_tg / cell_area from
+here.
 
 Usage:
   python scripts/budget_table.py --csv table.csv <run_dir> [<run_dir> ...]
@@ -30,16 +36,29 @@ REGIONS = {
     "S. Africa":   {"lat": (-35, 0),   "lon": (10, 50)},
     "Australia":   {"lat": (-45, -10), "lon": (110, 155)},
 }
-# Kok et al. (2021) Table 1, PM20 emission: mean, low, high [Tg/yr]
+# Kok et al. (2021), ACP 21, 8169, Table 1, inverse model, annual PM20 dust
+# emission, median and 1-sigma range [Tg/yr] (printed as 10^3 Tg/yr). Keyed by the
+# ODEM box; the Kok region each box is compared with is named in KOK2021_NAME.
+# The boxes are not Kok's regions; the mapping is stated in the paper (Sect. 3).
 KOK2021 = {
-    "N. Africa":   (2727, 730, 11000),
-    "Middle East": (398, 100, 1700),
-    "East Asia":   (500, 130, 2000),
-    "N. America":  (50, 10, 300),
-    "S. America":  (90, 20, 500),
-    "S. Africa":   (70, 15, 350),
-    "Australia":   (180, 40, 900),
-    "Global":      (5000, 3400, 6600),
+    "N. Africa":   (2100, 1600, 4300),
+    "Middle East": (1380, 970, 2590),
+    "East Asia":   (580, 420, 1120),
+    "N. America":  (130, 50, 240),
+    "S. America":  (190, 100, 350),
+    "S. Africa":   (100, 60, 190),
+    "Australia":   (160, 90, 290),
+    "Global":      (4700, 3400, 9100),
+}
+KOK2021_NAME = {
+    "N. Africa":   "all of North Africa",
+    "Middle East": "Middle East/central Asia",
+    "East Asia":   "East Asia",
+    "N. America":  "North America",
+    "S. America":  "South America",
+    "S. Africa":   "southern Africa",
+    "Australia":   "Australia",
+    "Global":      "all source regions",
 }
 SEC_PER_YR = 365.25 * 24 * 3600
 
@@ -50,17 +69,29 @@ def cell_area(lat, lon):
     return cell[:, None] * np.ones((1, len(lon)))
 
 
+def annual_total_tg(F_mean, lat, lon, mask=None):
+    """Annual total [Tg/yr] of a time-mean flux F_mean [kg m-2 s-1] (the one convention)."""
+    F = np.nan_to_num(np.asarray(F_mean, dtype=np.float64))
+    A = cell_area(lat, lon)
+    if mask is not None:
+        F = F[mask]; A = A[mask]
+    return float((F * A).sum() * SEC_PER_YR / 1e9)
+
+
+def region_mask(lat, lon, box):
+    la = (lat >= box['lat'][0]) & (lat <= box['lat'][1])
+    lo = (lon >= box['lon'][0]) & (lon <= box['lon'][1])
+    return la[:, None] & lo[None, :]
+
+
 def budgets(path):
     with nc.Dataset(path) as d:
         lat = np.array(d.variables['lat'][:]); lon = np.array(d.variables['lon'][:])
         F = np.nan_to_num(np.array(d.variables['F_d_mean'][:], dtype=np.float64))
         meta = {k: str(d.getncattr(k)) for k in d.ncattrs()}
-    A = cell_area(lat, lon)
-    out = {'Global': float((F * A).sum() * SEC_PER_YR / 1e9)}
+    out = {'Global': annual_total_tg(F, lat, lon)}
     for name, box in REGIONS.items():
-        la = (lat >= box['lat'][0]) & (lat <= box['lat'][1])
-        lo = (lon >= box['lon'][0]) & (lon <= box['lon'][1])
-        out[name] = float((F[np.ix_(la, lo)] * A[np.ix_(la, lo)]).sum() * SEC_PER_YR / 1e9)
+        out[name] = annual_total_tg(F, lat, lon, region_mask(lat, lon, box))
     return out, meta, (lat, lon)
 
 
@@ -106,7 +137,9 @@ def main():
     if not rows:
         return
     regions = ['Global'] + list(REGIONS)
-    print('| run | scheme | Global Tg/yr | x Kok(5000) | ' + ' | '.join(f'{r} ({KOK2021[r][0]})' for r in regions[1:]) + ' |')
+    print(f"Constraint: Kok et al. (2021) Table 1, inverse model, PM20 emission, median (1-sigma range), Tg/yr: "
+          + '; '.join(f"{r} vs {KOK2021_NAME[r]} {KOK2021[r][0]} ({KOK2021[r][1]} to {KOK2021[r][2]})" for r in regions) + '\n')
+    print(f"| run | scheme | Global Tg/yr | x Kok({KOK2021['Global'][0]}) | " + ' | '.join(f'{r} ({KOK2021[r][0]})' for r in regions[1:]) + ' |')
     print('|' + '---|' * (4 + len(regions) - 1))
     for r in rows:
         cells = [r['run'], r['scheme'], f"{r['Global']:.0f}", f"{r['Global /Kok']:.2f}"]

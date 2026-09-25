@@ -51,29 +51,9 @@ M2_ANNUAL   = DATA_ROOT / "output_2006_merra2" / "odem_annual_mean.nc"
 DUEM_DIR    = DATA_ROOT / "merra2_data" / "adg"
 
 
-# ── Region definitions (lat/lon bounding boxes) ──────────────────
-REGIONS = {
-    "N. Africa":     {"lat": (0, 40),    "lon": (-20, 40)},
-    "Middle East":   {"lat": (12, 45),   "lon": (40, 65)},
-    "East Asia":     {"lat": (25, 50),   "lon": (70, 130)},
-    "N. America":    {"lat": (15, 50),   "lon": (-120, -80)},
-    "S. America":    {"lat": (-56, 0),   "lon": (-80, -35)},
-    "S. Africa":     {"lat": (-35, 0),   "lon": (10, 50)},
-    "Australia":     {"lat": (-45, -10), "lon": (110, 155)},
-}
-
-# Kok et al. (2021) Table 1 — PM20 values (direct, no conversion)
-# mean, low, high (Tg yr-1, PM20)
-KOK2021 = {
-    "N. Africa":     (2727, 730, 11000),
-    "Middle East":   (398,  100,  1700),
-    "East Asia":     (500,  130,  2000),
-    "N. America":    (50,   10,   300),
-    "S. America":    (90,   20,   500),
-    "S. Africa":     (70,   15,   350),
-    "Australia":     (180,  40,   900),
-    "Global":        (5000, 3400, 6600),
-}
+# ── Regions and the Kok et al. (2021) Table 1 constraint: one source ──
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from budget_table import REGIONS, KOK2021  # noqa: E402
 
 
 def compute_regional_budget(lat, lon, flux):
