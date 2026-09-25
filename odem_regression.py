@@ -21,6 +21,7 @@ Usage
 -----
   python odem_regression.py --pin   --archive-root <data root>
   python odem_regression.py --check --archive-root <data root>
+  python odem_regression.py --check --skip-missing --archive-root <unpacked data deposit>
   python odem_regression.py --compare-month new/odem_200601.nc ref/odem_200601.nc
 
 --pin writes odem_regression_pins.json. Regenerate it only deliberately, and never
@@ -58,6 +59,13 @@ RUNS = [
     # the AEM scheme in v2: --compare-month against its odem_200601.nc must be
     # bitwise. Added 2026-09-24.
     "output_2006_aem",
+    # v1.1 primaries on the MERRA-2 grid (2006, primary statics: conservative,
+    # z0a in log space; DEAD on the matched 2x2.5 maps). The published v1.1
+    # totals; pinned at the matrix freeze, 2026-09-25.
+    "output_v2/k14_m2_consl_2006",
+    "output_v2/aem_m2_cons_2006",
+    "output_v2/dead_g_m2_consl_2006",
+    "output_v2/dead_z_m2_consl_2006",
 ]
 
 # The three ctune020 runs are exact 0.4x scalings of their C_tune = 0.05
@@ -69,6 +77,29 @@ RUNS = [
 # same-inputs, same-code comparison, so anything above float noise is a change
 # in behaviour and should be looked at, not absorbed.
 RTOL = 1e-6
+
+# File name of each run's annual mean in the flat Zenodo data deposit
+# (v1.0: 10.5281/zenodo.19390605; byte-identical to the archived files). When
+# <archive-root>/<run>/odem_annual_mean.nc is absent the harness looks for
+# <archive-root>/<name> instead, so --archive-root may point at the unpacked
+# deposit. The v1.1 primaries follow odem_annual_mean_<run directory>.nc.
+DEPOSIT_NAMES = {
+    "output_2006":                      "odem_annual_mean_era5_3h_ctune005.nc",
+    "output_2006_era5_hourly":          "odem_annual_mean_era5_1h_ctune005.nc",
+    "output_2006_merra2":               "odem_annual_mean_merra2_ctune005.nc",
+    "output_2006_ctune020":             "odem_annual_mean_era5_3h_ctune020.nc",
+    "output_2006_era5_hourly_ctune020": "odem_annual_mean_era5_1h_ctune020.nc",
+    "output_2006_merra2_ctune020":      "odem_annual_mean_merra2_ctune020.nc",
+}
+
+
+def annual_mean_path(root, run):
+    """The run's annual-mean file under root: run directory first, then the deposit name."""
+    p = os.path.join(root, run, "odem_annual_mean.nc")
+    if os.path.exists(p):
+        return p
+    name = DEPOSIT_NAMES.get(run, f"odem_annual_mean_{os.path.basename(run)}.nc")
+    return os.path.join(root, name)
 
 
 def global_total_tg_per_year(path):
@@ -107,7 +138,7 @@ def model_fingerprint():
 def cmd_pin(root):
     pins = {"model_sha256_16": model_fingerprint(), "runs": {}}
     for run in RUNS:
-        path = os.path.join(root, run, "odem_annual_mean.nc")
+        path = annual_mean_path(root, run)
         if not os.path.exists(path):
             print(f"  skip  {run}: no annual-mean file")
             continue
@@ -120,7 +151,7 @@ def cmd_pin(root):
     return 0
 
 
-def cmd_check(root):
+def cmd_check(root, skip_missing=False):
     if not os.path.exists(PINS):
         print(f"no pin file at {PINS}; run --pin first")
         return 2
@@ -130,12 +161,13 @@ def cmd_check(root):
         print(f"note: odem.py has changed since pinning "
               f"({pins.get('model_sha256_16')} -> {now}). That is the point of this check.\n")
 
-    failures = 0
+    failures = 0; missing = 0
     for run, expect in pins["runs"].items():
-        path = os.path.join(root, run, "odem_annual_mean.nc")
+        path = annual_mean_path(root, run)
         if not os.path.exists(path):
             print(f"  MISS  {run}: archived file absent")
-            failures += 1
+            missing += 1
+            failures += 0 if skip_missing else 1
             continue
         total, meta = global_total_tg_per_year(path)
         want = expect["total_tg_per_year"]
@@ -144,7 +176,9 @@ def cmd_check(root):
         print(f"  {'ok  ' if ok else 'FAIL'}  {run:<34} {total:9.1f} vs {want:9.1f} Tg/yr  rel={rel:.2e}")
         failures += 0 if ok else 1
 
-    print(f"\n{len(pins['runs']) - failures} of {len(pins['runs'])} runs match")
+    checked = len(pins["runs"]) - (missing if skip_missing else 0)
+    print(f"\n{checked - failures} of {checked} runs match"
+          + (f" ({missing} absent, skipped)" if skip_missing and missing else ""))
     return 1 if failures else 0
 
 
@@ -179,8 +213,11 @@ def main():
     g.add_argument("--compare-month", nargs=2, metavar=("NEW", "REF"),
                    help="bitwise-compare two monthly flux files")
     p.add_argument("--archive-root", default=os.environ.get("ODEM_DATA", ""),
-                   help="directory holding the output_2006* run directories "
-                        "(default: $ODEM_DATA)")
+                   help="directory holding the run directories, or the unpacked flat data "
+                        "deposit (default: $ODEM_DATA)")
+    p.add_argument("--skip-missing", action="store_true",
+                   help="with --check: runs absent under --archive-root are reported, not failed "
+                        "(for a deposit that holds only some of the pinned runs)")
     args = p.parse_args()
 
     if args.compare_month:
@@ -188,7 +225,7 @@ def main():
     if not args.archive_root:
         print("--archive-root is required (or set ODEM_DATA)")
         return 2
-    return cmd_pin(args.archive_root) if args.pin else cmd_check(args.archive_root)
+    return cmd_pin(args.archive_root) if args.pin else cmd_check(args.archive_root, args.skip_missing)
 
 
 if __name__ == "__main__":

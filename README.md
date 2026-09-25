@@ -107,6 +107,44 @@ python regrid_met_conservative.py \
 `lsm` becomes a land fraction (thresholded at 0.5 by the model as before); the
 global attributes record the method, source, target grid and date.
 
+## Regression harness
+
+`odem_verify.py` checks the physics against external constraints; it does not
+check ODEM against itself. `odem_regression.py` does, with two assertions:
+
+1. **Budget.** The global annual total recomputed from each published
+   annual-mean file equals the value pinned in `odem_regression_pins.json`
+   (relative tolerance 1e-6). The pins cover the six v1.0 runs of the data
+   deposit, the four v1.1 primaries on the MERRA-2 grid (K14, AEM, DEAD-G,
+   DEAD-Z, 2006) and one development month.
+2. **Bitwise.** A freshly computed month is identical, value for value, to the
+   archived month it reproduces.
+
+The annual total is the time-mean flux times the spherical cell area times
+365.25 days, the convention used everywhere in the model and scripts.
+
+```bash
+# 1. Budget check against the data deposit (unpacked into one directory)
+python odem_regression.py --check --skip-missing --archive-root path/to/deposit
+
+# 1. Budget check against your own run directories (<root>/<run>/odem_annual_mean.nc)
+python odem_regression.py --check --archive-root path/to/runs
+
+# 2. Bitwise check of a month recomputed from the forcing
+python odem.py --merra2 merra2_data/merra2_dust_200601.nc ... --output-dir new
+python odem_regression.py --compare-month new/odem_200601.nc ref/odem_200601.nc
+```
+
+`--archive-root` accepts either layout: a run directory holding
+`odem_annual_mean.nc`, or the flat file names of the deposit. `--skip-missing`
+reports runs that are not present instead of failing on them, for a deposit
+that holds only some of the pinned runs. To reproduce a published year from the
+forcing, run it with `scripts/run_year.py` (same options as the pinned run,
+recorded in the `odem_*` attributes of its output) and point `--check` at the
+new directory. The v1.0 MERRA-2 year is reproduced with `--scheme k14 --regrid
+nearest`. `--pin` rewrites the pin file; do so only deliberately, never to make
+a failing check pass.
+
 ## Input data
 
 All input datasets are freely available from their original providers:
@@ -128,6 +166,8 @@ See the user manual for detailed variable lists and file naming conventions.
 odem.py                  # Main model
 odem_analysis.py         # Post-processing (summary, comparison, seasonal)
 odem_verify.py           # Physics verification suite (38 tests) + conservative-regrid unit tests
+odem_regression.py       # Regression harness (pinned budgets, bitwise month comparison)
+odem_regression_pins.json  # Pinned global totals of the published runs
 regrid_met_conservative.py  # ERA5 -> MERRA-2 grid conservative regrid (resolution experiment)
 requirements.txt
 scripts/
