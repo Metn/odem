@@ -66,6 +66,9 @@ RUNS = [
     "output_v2/aem_m2_cons_2006",
     "output_v2/dead_g_m2_consl_2006",
     "output_v2/dead_z_m2_consl_2006",
+    # Sensitivity row: AEM on MERRA-2 with the LeGrand et al. (2023) sandblasting
+    # term (--aem-sandblasting legrand), pinned 2026-09-25.
+    "output_v2/aem_lg_m2_cons_2006",
 ]
 
 # The three ctune020 runs are exact 0.4x scalings of their C_tune = 0.05
@@ -79,7 +82,7 @@ RUNS = [
 RTOL = 1e-6
 
 # File name of each run's annual mean in the flat Zenodo data deposit
-# (v1.0: 10.5281/zenodo.19390605; byte-identical to the archived files). When
+# (v1.0 data deposit: 10.5281/zenodo.19320862; byte-identical to the archived files). When
 # <archive-root>/<run>/odem_annual_mean.nc is absent the harness looks for
 # <archive-root>/<name> instead, so --archive-root may point at the unpacked
 # deposit. The v1.1 primaries follow odem_annual_mean_<run directory>.nc.
