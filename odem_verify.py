@@ -56,6 +56,7 @@ from odem import (air_density, median_particle_diameter, compute_emission, CONST
 from odem import (surface_state, flux_dead, dead_ustar_ft0, dead_fecan,
                   dead_saltation, dead_alpha, DEAD_CONST, SCHEMES)
 from odem import (InputData, DEAD_S_SOURCE, DEAD_T_BY_MAP, REGRID_FIELDS)
+from odem import flux_aem, aem_alpha, AEM_SANDBLASTING
 
 
 # ===========================================================================
@@ -805,6 +806,52 @@ def test_dead(R):
         R.ok("DEAD error without 10 m wind", str(e)[:60])
 
 
+def test_aem_sandblasting(R):
+    """AEM sandblasting term: default (MB95 Eq. 47 as in Hennen 2022) and the
+    LeGrand et al. (2023) Eq. 7 switch (--aem-sandblasting legrand)."""
+    print("\n[Level 1e] AEM sandblasting-term unit tests")
+    print("-" * 50)
+
+    # 1. LeGrand Eq. 7 in m-1: 100 x 10^(0.136 m_clay - 6), m_clay capped at 0.2.
+    #    Hand values: 0 % -> 1.0000e-4; 20 % and 40 % -> 100 x 10^(0.0272 - 6) = 1.06463e-4
+    #    (Eq. 7 prints the m_clay >= 0.2 branch as 1.06e-6 cm-1, the formula at 0.2 rounded).
+    a = aem_alpha(np.array([0.0, 20.0, 40.0]), 'legrand')
+    cap = 100.0 * 10.0 ** (0.136 * 0.2 - 6.0)
+    ok = (abs(a[0] - 1.0e-4) / 1.0e-4 < 1e-12 and abs(a[1] - cap) / cap < 1e-12 and a[2] == a[1]
+          and abs(cap - 1.06463e-4) / 1.06463e-4 < 1e-5)
+    (R.ok if ok else R.fail)("AEM legrand alpha (0 %, 20 %, 40 % clay; cap at 0.2)",
+                             f"{a[0]:.4e}, {a[1]:.4e}, {a[2]:.4e} m-1 (hand 1.0000e-4, {cap:.4e})")
+
+    # 2. Default alpha unchanged: 10^(0.134 clay% - 6), clay capped at 20 percent.
+    c = np.array([0.0, 10.0, 20.0, 40.0])
+    hand = 10.0 ** (0.134 * np.array([0.0, 10.0, 20.0, 20.0]) - 6.0)
+    d = aem_alpha(c, 'chappell')
+    ok = np.array_equal(d, hand) and AEM_SANDBLASTING == ('chappell', 'legrand')
+    (R.ok if ok else R.fail)("AEM chappell alpha (default) = 10^(0.134 clay% - 6), cap 20 %",
+                             f"{', '.join(f'{v:.4e}' for v in d)} m-1")
+
+    # 3. The switch changes alpha and nothing else: for cells of different clay,
+    #    F_legrand / F_chappell = alpha_legrand / alpha_chappell to float
+    #    precision; the default call is bitwise the explicit 'chappell' call;
+    #    the diagnostics carry alpha.
+    worst = 0.0; bitwise = True; n_emit = 0
+    for clay in (2.0, 8.0, 15.0, 25.0, 45.0):
+        met, static, lai = _make_dead_inputs(u10=20.0, clay=clay, swvl1=0.02)
+        state = surface_state(met, static, lai)
+        brdf = {'omega_n': np.array([[1.0]])}
+        F0, _ = flux_aem(met, static, state, brdf)
+        Fc, dc = flux_aem(met, static, state, brdf, sandblasting='chappell')
+        Fl, dl = flux_aem(met, static, state, brdf, sandblasting='legrand')
+        bitwise &= np.array_equal(F0, Fc)
+        if Fc[0, 0] > 0:
+            n_emit += 1
+            want = float(dl['alpha'][0, 0] / dc['alpha'][0, 0])
+            worst = max(worst, abs(float(Fl[0, 0] / Fc[0, 0]) - want) / want)
+    ok = bitwise and n_emit == 5 and worst < 1e-12
+    (R.ok if ok else R.fail)("AEM switch swaps alpha only (F ratio = alpha ratio)",
+                             f"{n_emit}/5 cells emit, max rel dev {worst:.1e}, default == chappell {bitwise}")
+
+
 def test_v11_options(R):
     """v1.1 run options: DEAD S-map selection and T by map, uniform clay,
     per-static regrid overrides."""
@@ -1501,6 +1548,7 @@ Examples:
         test_regrid(R)
         test_dead(R)
         test_v11_options(R)
+        test_aem_sandblasting(R)
 
     if args.diags:
         test_diagnostic_ranges(args.diags, R)

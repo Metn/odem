@@ -62,6 +62,12 @@ in forcing. `k14` (default) is the Kok et al. (2014) / Leung et al. (2023)
 scheme of v1.0; `aem` is the albedo-based drag partition of Chappell and Webb
 (2016) with MB95 saltation and needs `--modis-brdf`.
 
+`--aem-sandblasting legrand` is a sensitivity switch for `aem` only: it replaces
+the sandblasting term (default: Marticorena and Bergametti 1995 Eq. 47 as coded
+in the Google Earth Engine script of Hennen 2022) with Eq. 7 of LeGrand et al.
+(2023), and changes nothing else in the chain. The choice is written to the
+output attributes as `odem_aem_sandblasting`.
+
 #### DEAD scheme
 
 `dead_g` and `dead_z` implement the DEAD scheme of Zender et al. (2003a) as it

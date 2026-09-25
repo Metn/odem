@@ -1347,19 +1347,42 @@ AEM_SIZE_BINS = np.array([
 AEM_UST_T = AEM_SIZE_BINS[:, 1]  # threshold u*_t per bin
 
 
-def flux_aem(met, static, state, brdf):
+AEM_SANDBLASTING = ('chappell', 'legrand')
+
+
+def aem_alpha(clay_pct, form='chappell'):
+    """Sandblasting efficiency alpha [m-1] of the AEM vertical flux F = f_bare Q alpha.
+
+    'chappell' (default, the AEM primary): 10^(0.134 clay% - 6) with clay in
+        percent capped at 20, applied in m-1 as written. This is Marticorena and
+        Bergametti (1995) Eq. 47 evaluated as in the Google Earth Engine script of
+        Hennen (2022, Zenodo 10.5281/zenodo.5816911) that this chain ports.
+    'legrand' (sensitivity switch): LeGrand et al. (2023, GMD 16, 1009) Eq. 7,
+        beta = 10^(0.136 m_clay - 6) cm-1 with m_clay the clay mass fraction,
+        m_clay >= 0.2 held at the 0.2 value (1.06e-6 cm-1), converted to m-1 (x100).
+    """
+    if form == 'chappell':
+        return 10.0 ** (0.134 * np.clip(clay_pct, 0.0, 20.0) - 6.0)
+    if form == 'legrand':
+        return 100.0 * 10.0 ** (0.136 * np.clip(clay_pct / 100.0, 0.0, 0.20) - 6.0)
+    raise ValueError(f"unknown AEM sandblasting form {form!r}; choose from {AEM_SANDBLASTING}")
+
+
+def flux_aem(met, static, state, brdf, sandblasting='chappell'):
     """
     Albedo-based drag partition (Chappell and Webb, 2016) with MB95 saltation
-    and the Marticorena (1999) clay sandblasting efficiency, from a surface
-    state. No global tuning constant (c = 1).
+    and the Marticorena and Bergametti (1995) clay sandblasting efficiency,
+    from a surface state. No global tuning constant (c = 1).
 
     Physics chain:
       1. MODIS BRDF omega_n -> rescale -> u*_s/U_h -> u*_s
       2. MB95 saltation: Q = (rho_a/g) u*_s^3 sum_i E_f(d_i), 10 size bins,
          Fecan moisture correction applied to each bin threshold
-      3. Vertical flux: F = f_bare Q alpha(clay)
+      3. Vertical flux: F = f_bare Q alpha(clay), alpha from aem_alpha
 
     brdf : dict — {'omega_n': array on the meteo grid} from InputData.get_brdf
+    sandblasting : 'chappell' (default) or 'legrand' (--aem-sandblasting); swaps
+        only alpha, see aem_alpha.
     Bare fraction is f_erodible x mask, without the LAI factor of the K14 chain,
     because vegetation sheltering enters through the albedo here.
     """
@@ -1394,6 +1417,10 @@ def flux_aem(met, static, state, brdf):
     # 2. Bare soil fraction
     f_bare = static['f_erodible'] * mask
 
+    # Sandblasting efficiency: MB95 Eq. 47 as in Hennen (2022), clay% capped at
+    # 20, in m-1 (default), or LeGrand et al. (2023) Eq. 7 (see aem_alpha)
+    alpha = aem_alpha(clay_pct, sandblasting)
+
     # 3. MB95 saltation flux over 10 size bins
     active = (wnd_frc_slt > AEM_UST_T.min()) & (mask > 0.5) & (f_bare > 0)
     F_d = np.zeros_like(rhoa)
@@ -1415,11 +1442,7 @@ def flux_aem(met, static, state, brdf):
 
         Q = (rho_a / C['g']) * u_s ** 3 * E_sum
 
-        # alpha = 10^(0.134 clay% - 6), Marticorena (1999), clay capped at 20 %
-        clay_active = np.clip(clay_pct[active], 0.0, 20.0)
-        alpha = 10.0 ** (0.134 * clay_active - 6.0)
-
-        F_d[active] = f_bare[active] * Q * alpha
+        F_d[active] = f_bare[active] * Q * alpha[active]
 
     F_d = np.nan_to_num(F_d, nan=0.0, posinf=0.0, neginf=0.0)
     F_d = np.clip(F_d, 0.0, None)
@@ -1428,7 +1451,7 @@ def flux_aem(met, static, state, brdf):
         'rhoa': rhoa, 'wnd_frc_slt': wnd_frc_slt,
         'f_bare': f_bare, 'f_moisture': f_moisture,
         'ustar_ratio': ustar_ratio, 'omega_ns': omega_ns,
-        'U_10m': U_10m,
+        'U_10m': U_10m, 'alpha': alpha,
     }
     return F_d, diag
 
@@ -1941,7 +1964,7 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
               save_diags=False, meteo_source='era5', scheme='k14',
               max_steps=None, brdf_file=None, regrid_method='nearest',
               hold=(), dead_dir=None, dead_tuning=None, regrid_fields=None,
-              dead_s_map='2x25', dead_clay_uniform=None):
+              dead_s_map='2x25', dead_clay_uniform=None, aem_sandblasting='chappell'):
     """Run ODEM — Offline Dust Emission Model.
 
     meteo_path:      ERA5 or MERRA-2 file/directory.
@@ -1963,11 +1986,17 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     dead_s_map:      '2x25' (default) or '025' (Meng 0.25 deg Ginoux, dead_g only).
     dead_clay_uniform: None (SoilGrids clay) or a clay percentage held uniform
                      in DEAD (20 = GEOS-Chem's SOI_TXT_GET override).
+    aem_sandblasting: 'chappell' (default) or 'legrand' (LeGrand et al. 2023 Eq. 7),
+                     the AEM sandblasting term only (aem_alpha); a sensitivity switch.
     """
     if scheme not in SCHEMES:
         raise ValueError(f"unknown scheme '{scheme}'; choose from {sorted(SCHEMES)}")
     if scheme == 'aem' and not brdf_file:
         raise ValueError("--scheme aem needs --modis-brdf <modis_brdf_YYYY.nc>")
+    if aem_sandblasting not in AEM_SANDBLASTING:
+        raise ValueError(f"--aem-sandblasting {aem_sandblasting!r}; choose from {AEM_SANDBLASTING}")
+    if aem_sandblasting != 'chappell' and scheme != 'aem':
+        raise ValueError("--aem-sandblasting applies to the aem scheme only")
     hold = tuple(h for h in hold if h)
     if hold and scheme != 'k14':
         raise ValueError("--hold applies to the k14 scheme only")
@@ -1989,6 +2018,8 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
         cfg['dead_tuning'] = float(dead_tuning)
         cfg['dead_clay'] = ('SoilGrids' if dead_clay_uniform is None
                             else f'uniform {float(dead_clay_uniform):g} percent')
+    if scheme == 'aem':
+        cfg['aem_sandblasting'] = aem_sandblasting
     RUN_SCHEME['config'] = cfg
     RUN_SCHEME['label'] = SCHEME_LABEL[scheme] + (f" [held: {','.join(hold)}]" if hold else '')
     t0 = time.time()
@@ -2005,6 +2036,10 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
     log.info(f"  Scheme:     {scheme} ({SCHEME_LABEL.get(scheme, scheme)})")
     if brdf_file:
         log.info(f"  MODIS BRDF: {brdf_file}")
+    if scheme == 'aem':
+        log.info(f"  AEM sandblasting: {aem_sandblasting}"
+                 + (" (LeGrand et al. 2023 Eq. 7; sensitivity switch)" if aem_sandblasting == 'legrand'
+                    else " (MB95 Eq. 47 as in Hennen 2022; default)"))
     if hold:
         log.info(f"  Hold:       {', '.join(hold)} at neutral values")
     if scheme in DEAD_S_SOURCE:
@@ -2062,6 +2097,8 @@ def run_model(meteo_path, soilgrids_dir, prigent_file, modis_lai_dir,
         scheme_kwargs = {'T': float(dead_tuning)}
         if dead_clay_uniform is not None:
             scheme_kwargs['clay_pct'] = float(dead_clay_uniform)
+    elif scheme == 'aem':
+        scheme_kwargs = {'sandblasting': aem_sandblasting}
     else:
         scheme_kwargs = {}
     flux_fn = SCHEMES[scheme]
@@ -2247,6 +2284,9 @@ Examples:
     p.add_argument('--dead-clay-uniform', type=float, default=None, metavar='PCT',
                    help='Hold clay uniform at PCT percent in DEAD (20 = GEOS-Chem); '
                         'default SoilGrids clay')
+    p.add_argument('--aem-sandblasting', choices=AEM_SANDBLASTING, default='chappell',
+                   help='AEM sandblasting term only: chappell (default, MB95 Eq. 47 as in '
+                        'Hennen 2022) or legrand (LeGrand et al. 2023 Eq. 7); sensitivity switch')
     p.add_argument('--regrid-field', action='append', default=[], metavar='GROUP=METHOD',
                    help='Override --regrid for one static group (repeatable); groups '
                         f'{",".join(REGRID_FIELDS)}, methods {",".join(REGRID_FIELD_METHODS)}')
@@ -2279,6 +2319,7 @@ Examples:
         regrid_fields=dict(kv.split('=', 1) for kv in args.regrid_field),
         dead_s_map=args.dead_s_map,
         dead_clay_uniform=args.dead_clay_uniform,
+        aem_sandblasting=args.aem_sandblasting,
     )
 
 
