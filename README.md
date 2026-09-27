@@ -1,8 +1,8 @@
-# ODEM v1.0
+# ODEM v1.1
 
 **Offline Dust Emission Model** for reanalysis-driven global dust source estimation.
 
-ODEM is a standalone Python model that computes global gridded dust emission fluxes from reanalysis meteorological forcing. It implements the brittle fragmentation emission parameterization of [Kok et al. (2014)](https://doi.org/10.5194/acp-14-13023-2014) with the parameter choices and implementation of [Leung et al. (2023)](https://doi.org/10.5194/acp-23-6487-2023).
+ODEM is a standalone Python model that computes global gridded dust emission fluxes from reanalysis meteorological forcing. Its default scheme implements the brittle fragmentation emission parameterization of [Kok et al. (2014)](https://doi.org/10.5194/acp-14-13023-2014) with the parameter choices and implementation of [Leung et al. (2023)](https://doi.org/10.5194/acp-23-6487-2023). Version 1.1 adds the albedo-based drag-partition scheme of Chappell and Webb (2016) and the DEAD scheme as configured in GEOS-Chem, selectable with `--scheme`; the v1.0 defaults are unchanged.
 
 ## Features
 
@@ -10,7 +10,8 @@ ODEM is a standalone Python model that computes global gridded dust emission flu
 - Operates at native reanalysis resolution (0.25° for ERA5, 0.5°×0.625° for MERRA-2)
 - Single forward pass per timestep — no spin-up, no inter-timestep memory
 - Process-based emission physics: soil particle size, moisture inhibition, aerodynamic drag partition, turbulent intermittency
-- Verification suite with 38 physics unit tests
+- Three emission scheme families on one common surface state (K14, AEM, DEAD with two source maps)
+- Verification suite with 45 physics unit tests and a regression harness against the published runs
 
 ## Requirements
 
@@ -53,7 +54,7 @@ are put on the meteorology grid by nearest neighbour by default. Add
 normalised over valid source cells only, so a cell with any valid source gets
 the area mean of its valid part. The default output is unchanged.
 
-### Emission schemes (v2)
+### Emission schemes (v1.1)
 
 `--scheme` selects the emission physics; every scheme runs on the same
 surface state (land and snow mask, air density, soil moisture, bare-soil
@@ -84,18 +85,25 @@ Ginoux et al. (2001) topographic source function (`GOC_SRC`), `dead_z` the
 Zender et al. (2003b) geomorphic erodibility (`EF_GEO`), both read from the
 GEOS-Chem `DUST_DEAD` input directory given with `--dead-inputs` and regridded
 onto the meteorology grid with the run's `--regrid` method. T is the GEOS-Chem
-global mass tuning factor (`--dead-tuning`, default 4.7376e-4, the MERRA-2
-native-grid value of the offline DEAD emissions); the 10 m wind (`u10`, `v10`
+global mass tuning factor (`--dead-tuning`); its default follows the source
+map: 4.7586e-4 with the 2 x 2.5 degree maps (`--dead-s-map 2x25`, the default)
+and 4.7376e-4 with the 0.25 degree Ginoux map of Meng et al. (2021)
+(`--dead-s-map 025`, `dead_g` only). `--dead-clay-uniform PCT` holds the clay
+fraction uniform, as GEOS-Chem does at 20 percent. The 10 m wind (`u10`, `v10`
 or MERRA-2 `U10M`, `V10M`) must be in the meteorology file. The docstring of
-`flux_dead` lists the GEOS-Chem details that are not reproduced (uniform 20
-percent clay, bare fraction from `LF_DRY`, fractional snow, bin partition).
+`flux_dead` lists the GEOS-Chem details that are not reproduced (bare fraction
+from `LF_DRY`, fractional snow, bin partition).
 
 ```bash
-python odem.py     --merra2 merra2_data/merra2_dust_200601.nc     --soilgrids soilgrids/     --prigent prigent_data/Prigent_2005_roughness_0.25x0.25.nc     --modis-lai modis_lai/2006     --landcover modis_landcover/modis_landcover_erodibility_2006.nc     --scheme dead_g --dead-inputs dust_inputs/dead_geoschem_v2014-07     --dead-tuning 4.7376e-4 --save-diags --output-dir output_dead_g
+python odem.py     --merra2 merra2_data/merra2_dust_200601.nc     --soilgrids soilgrids/     --prigent prigent_data/Prigent_2005_roughness_0.25x0.25.nc     --modis-lai modis_lai/2006     --landcover modis_landcover/modis_landcover_erodibility_2006.nc     --scheme dead_g --dead-inputs dust_inputs/dead_geoschem_v2019-06     --save-diags --output-dir output_dead_g
 ```
 
-Other v2 flags: `--max-steps N` (development only, stops after N timesteps),
-`--modis-brdf` (the `aem` scheme), `--regrid conservative`.
+Other v1.1 flags: `--max-steps N` (development only, stops after N timesteps),
+`--modis-brdf` (the `aem` scheme), `--regrid conservative`, `--regrid-field
+GROUP=METHOD` (per-static override, methods `nearest`, `conservative`,
+`conservative_log`), `--hold FACTOR,...` (K14 factors held at their neutral
+values). Every run writes its options as `odem_*` global attributes of the
+output files.
 
 ### Resolution experiment: ERA5 on the MERRA-2 grid
 
@@ -171,13 +179,20 @@ See the user manual for detailed variable lists and file naming conventions.
 ```
 odem.py                  # Main model
 odem_analysis.py         # Post-processing (summary, comparison, seasonal)
-odem_verify.py           # Physics verification suite (38 tests) + conservative-regrid unit tests
+odem_verify.py           # Physics verification suite (45 unit tests, incl. regrid, DEAD, AEM, merge_year)
 odem_regression.py       # Regression harness (pinned budgets, bitwise month comparison)
 odem_regression_pins.json  # Pinned global totals of the published runs
 regrid_met_conservative.py  # ERA5 -> MERRA-2 grid conservative regrid (resolution experiment)
 requirements.txt
 scripts/
+  run_year.py             # A year as parallel single-month processes (resumable)
+  merge_year.py           # Assemble monthly outputs into the files of a single run
+  budget_table.py         # Global and regional annual budgets, Kok et al. (2021) ratios, monthly totals
+  decompose.py            # Resolution / forcing / convention decomposition of E5/M2
+  ladder_table.py, run_ladder.sh  # K14 hold ladder (one factor at its neutral value at a time)
   scale_ctune.py          # Scale output to different C_tune values
+  brdf_tif_to_nc.py       # MODIS BRDF shadow parameter GeoTIFF -> NetCDF (AEM input)
+  dev/                    # Development checks (bitwise split test, Meng 2021 comparison, DEAD variants)
   figures/               # Paper figure generation (Figs. 2–11)
     gmd_style.py          # Shared matplotlib style
     plot_f02_static_inputs.py
@@ -203,7 +218,7 @@ python scripts/figures/plot_f02_static_inputs.py
 
 ## Reference
 
-Baykara, M.: ODEM v1.0: an offline dust emission model for reanalysis-driven source estimation, Geosci. Model Dev., in preparation, 2026.
+Baykara, M.: ODEM v1.1: a standalone dust emission model with interchangeable emission schemes and reanalysis forcings, EGUsphere [preprint], https://doi.org/10.5194/egusphere-2026-1905, in review, 2026.
 
 ## License
 
