@@ -12,7 +12,9 @@ Usage:
 The month directories are what scripts/run_year.py writes. The merged annual
 mean equals the one run_model() writes for a full-year run up to the order
 of floating-point accumulation (relative 1e-15), so the regression harness
-budget check applies unchanged.
+budget check applies unchanged. Both merged files carry the scheme and the
+odem_* run-configuration attributes of the monthly files, as a single-process
+run does; months whose configuration differs are refused.
 """
 import argparse
 import datetime as dt
@@ -43,6 +45,7 @@ def main():
     diag_sum = {}
     diag_ok = True
     static_src = None
+    run_config = None
     monthly_files = []
     for d in mdirs:
         mfiles = sorted(glob.glob(os.path.join(d, 'odem_[0-9]*.nc')))
@@ -54,6 +57,12 @@ def main():
             lon = np.array(ds.variables['lon'][:]); lat = np.array(ds.variables['lat'][:])
             tv = ds.variables['time']
             times = nc.num2date(tv[:], tv.units, getattr(tv, 'calendar', 'standard'))
+            cfg = {k: str(ds.getncattr(k)) for k in ds.ncattrs()
+                   if k == 'scheme' or k.startswith('odem_')}
+        if run_config is None:
+            run_config = cfg
+        elif cfg != run_config:
+            raise SystemExit(f'{mf}: run configuration {cfg} differs from the first month {run_config}')
         n = F.shape[0]
         if F_sum is None:
             F_sum = np.zeros(F.shape[1:], dtype=np.float64)
@@ -103,6 +112,9 @@ def main():
             ds.title = 'ODEM — Offline Dust Emission Model — annual mean'
             ds.source = getattr(m0, 'source', '')
             ds.scheme = getattr(m0, 'scheme', '')
+            for k in m0.ncattrs():
+                if k.startswith('odem_'):
+                    ds.setncattr(k, m0.getncattr(k))
         ds.period = f'{t_start} to {t_end}'
         ds.n_timesteps = str(n_total)
         ds.merged_from = f'{len(monthly_files)} monthly runs by scripts/merge_year.py'

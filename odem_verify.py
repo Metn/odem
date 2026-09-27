@@ -852,6 +852,68 @@ def test_aem_sandblasting(R):
                              f"{n_emit}/5 cells emit, max rel dev {worst:.1e}, default == chappell {bitwise}")
 
 
+def test_merge_year(R):
+    """scripts/merge_year.py: the merged annual and diagnostic means carry the
+    scheme and odem_* configuration attributes of the monthly files; months
+    of different configuration are refused."""
+    import subprocess
+    import tempfile
+    print("\n[Level 1f] merge_year unit test")
+    print("-" * 50)
+    script = Path(__file__).parent / 'scripts' / 'merge_year.py'
+    lon = np.arange(-180.0, 180.0, 45.0); lat = np.array([-45.0, 0.0, 45.0])
+    cfg = {'scheme': 'aem', 'odem_regrid': 'conservative', 'odem_aem_sandblasting': 'legrand'}
+    rng = np.random.default_rng(5)
+    fields = [rng.random((n, lat.size, lon.size)).astype(np.float32) * 1e-9 for n in (3, 2)]
+
+    def write_months(root, cfgs):
+        for m, (F, c) in enumerate(zip(fields, cfgs), start=1):
+            d = os.path.join(root, f'm{m:02d}'); os.makedirs(d)
+            with nc4.Dataset(os.path.join(d, f'odem_2006{m:02d}.nc'), 'w') as ds:
+                ds.createDimension('time', F.shape[0])
+                ds.createDimension('lat', lat.size); ds.createDimension('lon', lon.size)
+                t = ds.createVariable('time', 'f8', ('time',))
+                t.units = f'hours since 2006-{m:02d}-01 00:00:00'; t.calendar = 'standard'
+                t[:] = np.arange(F.shape[0])
+                ds.createVariable('lat', 'f8', ('lat',))[:] = lat
+                ds.createVariable('lon', 'f8', ('lon',))[:] = lon
+                ds.createVariable('F_d', 'f4', ('time', 'lat', 'lon'))[:] = F
+                for k, v in c.items():
+                    ds.setncattr(k, v)
+            with nc4.Dataset(os.path.join(d, 'odem_diag_mean.nc'), 'w') as ds:
+                ds.createDimension('lat', lat.size); ds.createDimension('lon', lon.size)
+                ds.createVariable('lat', 'f8', ('lat',))[:] = lat
+                ds.createVariable('lon', 'f8', ('lon',))[:] = lon
+                ds.createVariable('u_star', 'f4', ('lat', 'lon'))[:] = F.mean(axis=0)
+                for k, v in c.items():
+                    ds.setncattr(k, v)
+                ds.n_timesteps = F.shape[0]
+
+    def merge(root, out):
+        return subprocess.run([sys.executable, str(script), '--months-root', root, '--out', out, '--copy'],
+                              capture_output=True, text=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        root, out = os.path.join(td, 'months'), os.path.join(td, 'run')
+        write_months(root, [cfg, cfg])
+        rc = merge(root, out).returncode
+        with nc4.Dataset(os.path.join(out, 'odem_annual_mean.nc')) as ds:
+            got = {k: ds.getncattr(k) for k in ds.ncattrs() if k == 'scheme' or k.startswith('odem_')}
+            fm = np.asarray(ds.variables['F_d_mean'][:])
+        with nc4.Dataset(os.path.join(out, 'odem_diag_mean.nc')) as ds:
+            got_d = {k: ds.getncattr(k) for k in ds.ncattrs() if k == 'scheme' or k.startswith('odem_')}
+        want = np.concatenate(fields).astype(np.float64).mean(axis=0)
+        rel = float(np.max(np.abs(fm - want) / want))
+        root2, out2 = os.path.join(td, 'months2'), os.path.join(td, 'run2')
+        write_months(root2, [cfg, dict(cfg, odem_aem_sandblasting='chappell')])
+        p2 = merge(root2, out2)
+        refused = p2.returncode != 0 and 'differs from the first month' in p2.stderr
+    ok = rc == 0 and got == cfg and got_d == cfg and rel < 1e-6 and refused
+    (R.ok if ok else R.fail)("merge_year carries scheme + odem_* attrs (annual, diag); mixed config refused",
+                             f"annual {got == cfg}, diag {got_d == cfg}, F_d_mean max rel dev {rel:.1e}, "
+                             f"mixed months refused {refused}")
+
+
 def test_v11_options(R):
     """v1.1 run options: DEAD S-map selection and T by map, uniform clay,
     per-static regrid overrides."""
@@ -1549,6 +1611,7 @@ Examples:
         test_dead(R)
         test_v11_options(R)
         test_aem_sandblasting(R)
+        test_merge_year(R)
 
     if args.diags:
         test_diagnostic_ranges(args.diags, R)
