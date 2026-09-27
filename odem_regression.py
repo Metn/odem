@@ -131,11 +131,14 @@ def global_total_tg_per_year(path):
 
 
 def model_fingerprint():
-    """SHA-256 of odem.py, so a pin file records which model produced it."""
+    """SHA-256 of odem.py with line endings normalised to LF, so a pin file
+    records which model produced it and the same source gives the same
+    fingerprint on every platform (git checkouts with core.autocrlf differ
+    only in CRLF versus LF)."""
     p = os.path.join(HERE, "odem.py")
     if not os.path.exists(p):
         return None
-    return hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
+    return hashlib.sha256(open(p, "rb").read().replace(b"\r\n", b"\n")).hexdigest()[:16]
 
 
 def cmd_pin(root):
