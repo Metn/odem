@@ -16,8 +16,9 @@ ODEM is a standalone Python model that computes global gridded dust emission flu
 ## Requirements
 
 - Python 3.10+
-- NumPy, SciPy, xarray, netCDF4, pandas
-- matplotlib (post-processing only)
+- NumPy, SciPy, netCDF4 (the model)
+- matplotlib (verification plots and post-processing), cartopy (figure scripts)
+- xarray (`scripts/scale_ctune.py`), rasterio (`scripts/brdf_tif_to_nc.py`)
 
 ```bash
 pip install -r requirements.txt

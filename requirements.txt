@@ -1,11 +1,13 @@
-# Dust Emission Model — dependencies
+# ODEM dependencies
+# model, regression tests, regridding, year runner and table scripts
 numpy
-pandas
-xarray
+scipy
 netCDF4
-rioxarray
-geopandas
-shapely
-requests
-cdsapi
+# verification plots, odem_analysis.py and the figure scripts
 matplotlib
+# figure scripts (map projections)
+cartopy
+# scripts/scale_ctune.py
+xarray
+# scripts/brdf_tif_to_nc.py (GeoTIFF to NetCDF conversion only)
+rasterio
