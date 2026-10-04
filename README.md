@@ -192,6 +192,7 @@ scripts/
   decompose.py            # Resolution / forcing / convention decomposition of E5/M2
   ladder_table.py, run_ladder.sh  # K14 hold ladder (one factor at its neutral value at a time)
   scale_ctune.py          # Scale output to different C_tune values
+  gee_export_brdf.js      # Google Earth Engine export of the MODIS BRDF shadow parameter (AEM input)
   brdf_tif_to_nc.py       # MODIS BRDF shadow parameter GeoTIFF -> NetCDF (AEM input)
   dev/                    # Development checks (bitwise split test, Meng 2021 comparison, DEAD variants)
   figures/               # Paper figure generation (Figs. 2–11)
