@@ -69,6 +69,31 @@ RUNS = [
     # Sensitivity row: AEM on MERRA-2 with the LeGrand et al. (2023) sandblasting
     # term (--aem-sandblasting legrand), pinned 2026-09-25.
     "output_v2/aem_lg_m2_cons_2006",
+    # The remaining v1.1 runs of the data deposit, pinned 2026-10-06, so that every
+    # published v1.1 total is checked. ERA5 on its native grid (E5) and ERA5
+    # regridded to the MERRA-2 grid (E5c), plus the MERRA-2 instantaneous-wind
+    # runs (M2i) of the wind-driven schemes.
+    "output_v2/k14_e5_consl_2006",
+    "output_v2/k14_e5c_consl_2006",
+    "output_v2/aem_e5_cons_2006",
+    "output_v2/aem_e5c_cons_2006",
+    "output_v2/aem_m2i_cons_2006",
+    "output_v2/dead_g_e5_consl_2006",
+    "output_v2/dead_g_e5c_consl_2006",
+    "output_v2/dead_g_m2i_consl_2006",
+    "output_v2/dead_z_e5_consl_2006",
+    "output_v2/dead_z_e5c_consl_2006",
+    "output_v2/dead_z_m2i_consl_2006",
+    # Sensitivity and validation rows: DEAD-G with the 0.25 degree source map, and
+    # the GEOS-Chem configuration (0.25 degree map, uniform 20 % clay).
+    "output_v2/dead_g025_m2_consl_2006",
+    "output_v2/dead_g025c20_m2_consl_2006",
+    # Statics sensitivity (arithmetic conservative z0a) and the nearest-neighbour
+    # reproduction row; k14_m2_near_2006 is bitwise equal to output_2006_merra2.
+    "output_v2/k14_m2_cons_2006",
+    "output_v2/k14_e5c_cons_2006",
+    "output_v2/k14_e5_cons_2006",
+    "output_v2/k14_m2_near_2006",
 ]
 
 # The three ctune020 runs are exact 0.4x scalings of their C_tune = 0.05

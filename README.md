@@ -11,7 +11,7 @@ ODEM is a standalone Python model that computes global gridded dust emission flu
 - Single forward pass per timestep — no spin-up, no inter-timestep memory
 - Process-based emission physics: soil particle size, moisture inhibition, aerodynamic drag partition, turbulent intermittency
 - Three emission scheme families on one common surface state (K14, AEM, DEAD with two source maps)
-- Verification suite with 45 physics unit tests and a regression harness against the published runs
+- Verification suite with 45 physics unit tests and regression tests against the published runs
 
 ## Requirements
 
@@ -122,7 +122,7 @@ python regrid_met_conservative.py \
 `lsm` becomes a land fraction (thresholded at 0.5 by the model as before); the
 global attributes record the method, source, target grid and date.
 
-## Regression harness
+## Regression tests
 
 `odem_verify.py` checks the physics against external constraints; it does not
 check ODEM against itself. `odem_regression.py` does, with two assertions:
@@ -130,8 +130,9 @@ check ODEM against itself. `odem_regression.py` does, with two assertions:
 1. **Budget.** The global annual total recomputed from each published
    annual-mean file equals the value pinned in `odem_regression_pins.json`
    (relative tolerance 1e-6). The pins cover the six v1.0 runs of the data
-   deposit, the four v1.1 primaries on the MERRA-2 grid (K14, AEM, DEAD-G,
-   DEAD-Z, 2006) and one development month.
+   deposit, the 22 new runs of the v1.1 data deposit (2006; its 23rd file is
+   the v1.0 ERA5 run, already among the six) and one development month,
+   29 runs in total.
 2. **Bitwise.** A freshly computed month is identical, value for value, to the
    archived month it reproduces.
 
@@ -181,7 +182,7 @@ See the user manual for detailed variable lists and file naming conventions.
 odem.py                  # Main model
 odem_analysis.py         # Post-processing (summary, comparison, seasonal)
 odem_verify.py           # Physics verification suite (45 unit tests, incl. regrid, DEAD, AEM, merge_year)
-odem_regression.py       # Regression harness (pinned budgets, bitwise month comparison)
+odem_regression.py       # Regression tests (pinned budgets, bitwise month comparison)
 odem_regression_pins.json  # Pinned global totals of the published runs
 regrid_met_conservative.py  # ERA5 -> MERRA-2 grid conservative regrid (resolution experiment)
 requirements.txt
